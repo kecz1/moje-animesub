@@ -13,7 +13,7 @@ COPY --chown=user . .
 ENV PORT=7860
 ENV BASE_URL=""
 
-USER user
+USER node
 
 EXPOSE 7860
 
