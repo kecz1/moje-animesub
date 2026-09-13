@@ -2,10 +2,11 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-COPY --chown=user package*.json ./
+COPY package*.json ./
 RUN npm ci --only=production
 
-COPY --chown=user . .
+# Skopiuj pliki i od razu ustaw użytkownika 'node' jako właściciela katalogu /app
+COPY --chown=node:node . .
 
 ENV PORT=7860
 ENV BASE_URL=""
