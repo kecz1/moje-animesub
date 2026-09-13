@@ -1,8 +1,5 @@
 FROM node:22-alpine
 
-# Utwórz użytkownika zgodnego z UID wymaganym przez HF Spaces
-RUN adduser -D -u 1000 user
-
 WORKDIR /app
 
 COPY --chown=user package*.json ./
