@@ -6,17 +6,8 @@ const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
 
-const os = require('os');
-const LOCAL_SUBS_DIR = path.join(os.tmpdir(), 'stremio-my-subs');
-
-if (!fs.existsSync(LOCAL_SUBS_DIR)) {
-    try {
-        fs.mkdirSync(LOCAL_SUBS_DIR, { recursive: true });
-        console.log(`[Init] Created local subtitles folder: ${LOCAL_SUBS_DIR}`);
-    } catch (err) {
-        console.error('[Init] Nie udało się utworzyć folderu na napisy:', err.message);
-    }
-}
+// Zmienna globalna dla BASE_URL - ustawiana przy starcie serwera
+let BASE_URL_RESOLVED = '';
 
 /** * Konwertuje czas SRT na milisekundy (przydatne do filtrowania i cięcia) 
  */
@@ -43,22 +34,19 @@ function formatSrtTime(ms) {
  */
 function convertTxtToSrt(textContent) {
     const lines = textContent.split(/\r?\n/);
-    // Jeśli plik to już SRT (tylko ze złym rozszerzeniem .txt)
     if (lines.some(l => l.includes('-->'))) {
         return textContent;
     }
     let srt = '';
     let counter = 1;
-    const fps = 23.976; // Domyślny FPS dla anime
+    const fps = 23.976;
 
-    // 1. Sprawdzenie czy to format TMPlayer (GG:MM:SS:Tekst)
     const isTMPlayer = lines.some(l => l.match(/^\d{2}:\d{2}:\d{2}:/));
     if (isTMPlayer) {
         const parsedLines = [];
         for (let line of lines) {
             line = line.trim();
             if (!line) continue;
-            // Dopasowuje HH:MM:SS:Tekst
             const match = line.match(/^(\d{2}):(\d{2}):(\d{2}):(.*)/);
             if (match) {
                 const hours = match[1];
@@ -69,11 +57,9 @@ function convertTxtToSrt(textContent) {
                 const timeInSeconds = parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseInt(seconds);
                 parsedLines.push({ timeStr: timeSrtFormat, timeSec: timeInSeconds, text: text });
             } else if (parsedLines.length > 0) {
-                // Sklejanie linii bez czasu z poprzednim napisem (usuwa znak '|' na początku jeśli jest)
                 parsedLines[parsedLines.length - 1].text += '\n' + line.replace(/^\|/, '');
             }
         }
-        // Generowanie SRT z obliczonym czasem końcowym
         for (let i = 0; i < parsedLines.length; i++) {
             const current = parsedLines[i];
             let endTimeStr;
@@ -101,12 +87,10 @@ function convertTxtToSrt(textContent) {
         return srt.length > 0 ? srt.trim() : textContent;
     }
 
-    // 2. Obsługa starych formatów (MPL2 / MicroDVD)
     const parsedOther = [];
     for (let line of lines) {
         line = line.trim();
         if (!line) continue;
-        // Format MPL2: [123][456]Tekst
         const mplMatch = line.match(/^\[(\d+)\]\[(\d+)\](.*)/);
         if (mplMatch) {
             const startMs = parseInt(mplMatch[1], 10) * 100;
@@ -115,7 +99,6 @@ function convertTxtToSrt(textContent) {
             parsedOther.push({ startMs, endMs, text });
             continue;
         }
-        // Format MicroDVD: {123}{456}Tekst
         const mdvdMatch = line.match(/^\{(\d+)\}\{(\d+)\}(.*)/);
         if (mdvdMatch) {
             const startMs = Math.round((parseInt(mdvdMatch[1], 10) / fps) * 1000);
@@ -124,7 +107,6 @@ function convertTxtToSrt(textContent) {
             parsedOther.push({ startMs, endMs, text });
             continue;
         }
-        // Jeśli linia nie ma znaczników, a mamy już jakiś napis w buforze
         if (parsedOther.length > 0) {
             parsedOther[parsedOther.length - 1].text += '\n' + line.replace(/^\|/, '');
         }
@@ -135,8 +117,6 @@ function convertTxtToSrt(textContent) {
     return srt.length > 0 ? srt.trim() : textContent;
 }
 
-/** * Konwertuje czas ASS (H:MM:SS.cc) na format SRT (HH:MM:SS,mmm) 
- */
 function assTimeToSrt(assTime) {
     const match = assTime.match(/(\d+):(\d{2}):(\d{2})\.(\d{2})/);
     if (!match) return '00:00:00,000';
@@ -148,8 +128,6 @@ function assTimeToSrt(assTime) {
     return `${hours}:${minutes}:${seconds},${millis}`;
 }
 
-/** * Usuwa tagi ASS z tekstu (np. {\i1}, {\b1}, {\pos(x,y)}, itp.) 
- */
 function stripAssTags(text) {
     let result = text.replace(/\{[^}]*\}/g, '');
     result = result.replace(/\\N/g, '\n');
@@ -158,8 +136,6 @@ function stripAssTags(text) {
     return result.trim();
 }
 
-/** * Oblicza podobieństwo dwóch tekstów używając Odległości Levenshteina. 
- */
 function calculateSimilarity(str1, str2) {
     const a = str1.toLowerCase().replace(/[^a-z0-9]/g, '');
     const b = str2.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -183,8 +159,6 @@ function calculateSimilarity(str1, str2) {
     return (maxLength - distance) / maxLength;
 }
 
-/** * Konwertuje napisy ASS/SSA do formatu SRT z algorytmem cięcia czasu (zapobiega nakładaniu)
- */
 function convertAssToSrt(assContent) {
     const lines = assContent.split('\n');
     let inEvents = false;
@@ -193,31 +167,24 @@ function convertAssToSrt(assContent) {
 
     for (const line of lines) {
         const trimmedLine = line.trim();
-
         if (trimmedLine.toLowerCase() === '[events]') {
             inEvents = true;
             continue;
         }
-
         if (trimmedLine.startsWith('[') && trimmedLine.toLowerCase() !== '[events]') {
             inEvents = false;
             continue;
         }
-
         if (!inEvents) continue;
-
         if (trimmedLine.toLowerCase().startsWith('format:')) {
-            const formatStr = trimmedLine.substring(7).trim();
-            formatFields = formatStr.split(',').map(f => f.trim().toLowerCase());
+            formatFields = trimmedLine.substring(7).trim().split(',').map(f => f.trim().toLowerCase());
             continue;
         }
-
         if (trimmedLine.toLowerCase().startsWith('dialogue:')) {
             const dialogueStr = trimmedLine.substring(9).trim();
             const parts = [];
             let current = '';
             let fieldCount = 0;
-
             for (let i = 0; i < dialogueStr.length; i++) {
                 const char = dialogueStr[i];
                 if (char === ',' && fieldCount < formatFields.length - 1) {
@@ -238,31 +205,21 @@ function convertAssToSrt(assContent) {
             if (parts.length <= Math.max(startIdx, endIdx, textIdx)) continue;
 
             const rawText = parts[textIdx];
-
-            // Wyłapujemy rysunki wektorowe
             if (/\{\\p[1-9]\}/i.test(rawText)) continue;
-            
             const text = stripAssTags(rawText);
             if (!text) continue;
-            
-            // Filtr śmieci wektorowych
             if (/^[ml]\s+\-?[\d.]+\s+\-?[\d.]+/i.test(text)) continue;
 
-            const srtStart = assTimeToSrt(parts[startIdx]);
-            const srtEnd = assTimeToSrt(parts[endIdx]);
-
-            const startMs = srtTimeToMs(srtStart);
-            const endMs = srtTimeToMs(srtEnd);
+            const startMs = srtTimeToMs(assTimeToSrt(parts[startIdx]));
+            const endMs = srtTimeToMs(assTimeToSrt(parts[endIdx]));
 
             if (endMs <= startMs) continue;
-            // Filtrujemy znaki wodne (powyżej 60 sekund)
             if (endMs - startMs > 60000) continue;
 
             rawDialogues.push({ startMs, endMs, text });
         }
     }
 
-    // Algorytm cięcia linii czasu
     const timePoints = new Set();
     rawDialogues.forEach(d => {
         timePoints.add(d.startMs);
@@ -282,12 +239,10 @@ function convertAssToSrt(assContent) {
             .map(d => d.text);
 
         if (activeTexts.length > 0) {
-            const uniqueTexts = [...new Set(activeTexts)];
-            slicedBlocks.push({ startMs: start, endMs: end, text: uniqueTexts.join('\n') });
+            slicedBlocks.push({ startMs: start, endMs: end, text: [...new Set(activeTexts)].join('\n') });
         }
     }
 
-    // Optymalizacja przyległych klatek
     const optimizedBlocks = [];
     for (const block of slicedBlocks) {
         if (optimizedBlocks.length > 0) {
@@ -303,20 +258,15 @@ function convertAssToSrt(assContent) {
     let srt = '';
     for (let i = 0; i < optimizedBlocks.length; i++) {
         const d = optimizedBlocks[i];
-        srt += `${i + 1}\n`;
-        srt += `${formatSrtTime(d.startMs)} --> ${formatSrtTime(d.endMs)}\n`;
-        srt += `${d.text}\n\n`;
+        srt += `${i + 1}\n${formatSrtTime(d.startMs)} --> ${formatSrtTime(d.endMs)}\n${d.text}\n\n`;
     }
-
     return srt.trim();
 }
 
-// Konfiguracja
 const BASE_URL = 'http://animesub.info';
 const SEARCH_URL = `${BASE_URL}/szukaj.php`;
 const DOWNLOAD_URL = `${BASE_URL}/sciagnij.php`;
 
-// Manifest wtyczki
 const manifest = {
     id: 'community.animesub.info',
     version: '1.0.0',
@@ -327,10 +277,7 @@ const manifest = {
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'kitsu'],
     catalogs: [],
-    behaviorHints: {
-        configurable: false,
-        configurationRequired: false
-    }
+    behaviorHints: { configurable: false, configurationRequired: false }
 };
 
 const builder = new addonBuilder(manifest);
@@ -363,16 +310,12 @@ async function getMetaInfo(type, id) {
         try {
             const kitsuUrl = `https://kitsu.io/api/edge/anime/${kitsuId}`;
             const response = await axios.get(kitsuUrl, {
-                headers: {
-                    'Accept': 'application/vnd.api+json',
-                    'Content-Type': 'application/vnd.api+json'
-                },
+                headers: { 'Accept': 'application/vnd.api+json', 'Content-Type': 'application/vnd.api+json' },
                 timeout: 5000
             });
             const anime = response.data.data.attributes;
             title = anime.titles?.en_jp || anime.canonicalTitle || anime.titles?.ja_jp || anime.titles?.en;
             year = anime.startDate ? parseInt(anime.startDate.substring(0, 4), 10) : null;
-            console.log(`[Kitsu] Pobrano: "${title}" (${year})`);
         } catch (error) {
             console.error('[Kitsu] Błąd pobierania metadanych:', error.message);
         }
@@ -387,13 +330,7 @@ async function getMetaInfo(type, id) {
             const metaUrl = `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`;
             const response = await axios.get(metaUrl, { timeout: 5000 });
             const meta = response.data.meta;
-            return {
-                title: meta.name,
-                year: meta.year,
-                season,
-                episode,
-                imdbId
-            };
+            return { title: meta.name, year: meta.year, season, episode, imdbId };
         } catch (error) {
             console.error('Błąd pobierania metadanych z Cinemeta:', error.message);
             return { imdbId, season, episode, title: null, year: null };
@@ -405,21 +342,13 @@ async function searchSubtitles(title, titleType = 'en') {
     const cacheKey = `${title}:${titleType}`;
     const cached = searchCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        console.log(`[Cache hit] ${title}`);
         return cached.results;
     }
-    console.log(`\n[Szukanie animesub.info] query: "${title}", type: "${titleType}"`);
     try {
-        const response = await session.get(SEARCH_URL, {
-            params: {
-                szukane: title,
-                pTitle: titleType
-            }
-        });
+        const response = await session.get(SEARCH_URL, { params: { szukane: title, pTitle: titleType } });
         const html = iconv.decode(Buffer.from(response.data), 'ISO-8859-2');
         const results = parseSearchResults(html);
         searchCache.set(cacheKey, { results, timestamp: Date.now() });
-        console.log(`[Znaleziono] ${results.length} wyników dla "${title}"`);
         return results;
     } catch (error) {
         console.error('Błąd wyszukiwania:', error.message);
@@ -444,8 +373,7 @@ function parseSearchResults(html) {
             const titleAlt = $(row3Cells[0]).text().trim();
             let downloadCount = 0;
             if (row3Cells.length > 3) {
-                const countText = $(row3Cells[3]).text().trim();
-                downloadCount = parseInt(countText.split(' ')[0], 10) || 0;
+                downloadCount = parseInt($(row3Cells[3]).text().trim().split(' ')[0], 10) || 0;
             }
             const downloadRow = $(table).find('tr.KKom');
             const form = downloadRow.find('form[method="POST"]');
@@ -454,18 +382,7 @@ function parseSearchResults(html) {
             const description = downloadRow.find('td.KNap[align="left"]').text().trim();
             if (!subtitleId || !downloadHash) return;
             const episodeInfo = parseEpisodeInfo(titleOrg, titleEng, titleAlt, description);
-            subtitles.push({
-                id: subtitleId,
-                hash: downloadHash,
-                titleOrg,
-                titleEng,
-                titleAlt,
-                author,
-                formatType,
-                downloadCount,
-                description,
-                ...episodeInfo
-            });
+            subtitles.push({ id: subtitleId, hash: downloadHash, titleOrg, titleEng, titleAlt, author, formatType, downloadCount, description, ...episodeInfo });
         } catch (error) {
             console.error('Błąd parsowania wiersza:', error.message);
         }
@@ -480,18 +397,14 @@ function parseEpisodeInfo(titleOrg, titleEng, titleAlt, description) {
     let epEnd = null;
     const texts = [titleOrg, titleEng, titleAlt, description].filter(Boolean);
     
-    // 1. Sprawdzanie sezonu
     for (const text of texts) {
         if (season === null) {
             const seasonMatch = text.match(/(?:Season|Sezon|S|Part)\s*\.?\s*(\d+)|(\d+)(?:nd|rd|th)\s+(?:Season|Sezon)/i);
-            if (seasonMatch) {
-                season = parseInt(seasonMatch[1] || seasonMatch[2], 10);
-            }
+            if (seasonMatch) season = parseInt(seasonMatch[1] || seasonMatch[2], 10);
         }
     }
     if (season === null) {
-        const titles = [titleOrg, titleEng, titleAlt].filter(Boolean);
-        for (const title of titles) {
+        for (const title of [titleOrg, titleEng, titleAlt].filter(Boolean)) {
             const romanMatch = title.match(/\b(II|III|IV|V|VI)\b/i);
             if (romanMatch) {
                 const romanToNum = { 'ii': 2, 'iii': 3, 'iv': 4, 'v': 5, 'vi': 6 };
@@ -500,8 +413,6 @@ function parseEpisodeInfo(titleOrg, titleEng, titleAlt, description) {
             }
         }
     }
-    
-    // 2. Szukanie paczek
     for (const text of texts) {
         if (epStart === null) {
             const rangeMatch = text.match(/(?:ep|odc|odcinki)?\s*\.?\s*(\d{1,3})\s*(?:-|~|do)\s*(\d{1,3})(?:\s|-|_|\]|\)|$)/i);
@@ -517,15 +428,11 @@ function parseEpisodeInfo(titleOrg, titleEng, titleAlt, description) {
             }
         }
     }
-    
-    // 3. Szukanie pojedynczego odcinka
     if (epStart === null) {
         for (const text of texts) {
             if (episode === null) {
                 const epMatch = text.match(/(?:ep|episode|odc|odcinek)\s*\.?\s*(\d+)/i);
-                if (epMatch) {
-                    episode = parseInt(epMatch[1], 10);
-                }
+                if (epMatch) episode = parseInt(epMatch[1], 10);
             }
         }
         if (episode === null) {
@@ -548,10 +455,7 @@ function generateSearchStrategies(title, season, episode) {
     const strategies = [];
     let fullWithSpace = title.replace(/:/g, ' ').replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
     let leftSide = title.split(':')[0].replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
-    let rightSide = "";
-    if (title.includes(':')) {
-        rightSide = title.split(':').slice(1).join(' ').replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
-    }
+    let rightSide = title.includes(':') ? title.split(':').slice(1).join(' ').replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim() : "";
     const nameVariants = [fullWithSpace, leftSide];
     if (rightSide && rightSide.length > 3) nameVariants.push(rightSide);
     
@@ -563,9 +467,7 @@ function generateSearchStrategies(title, season, episode) {
                 strategies.push({ type: 'en', query: `${name} Season ${season} ep${epPad}` });
             }
             strategies.push({ type: 'en', query: `${name} ep${epPad}` });
-            if (season && season > 1) {
-                strategies.push({ type: 'org', query: `${name} ${season} ep${epPad}` });
-            }
+            if (season && season > 1) strategies.push({ type: 'org', query: `${name} ${season} ep${epPad}` });
             strategies.push({ type: 'org', query: `${name} ep${epPad}` });
         }
     }
@@ -585,7 +487,6 @@ function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
     const targetsToCompare = [cleanTargetFull, ...targetParts].filter(p => p.length > 2);
     
     return subtitles.filter(sub => {
-        // 1. PORÓWNYWANIE TYTUŁÓW
         const titlesToCompare = [sub.titleOrg, sub.titleEng, sub.titleAlt].filter(Boolean);
         let isTitleMatch = false;
         for (const t of titlesToCompare) {
@@ -601,13 +502,11 @@ function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
         }
         if (!isTitleMatch) return false;
         
-        // 2. RYGORYSTYCZNY FILTR SEZONÓW
         if (targetSeason !== null) {
             if (sub.season !== null && sub.season !== targetSeason) return false;
             if (targetSeason > 1 && sub.season === null) return false;
         }
         
-        // 3. FILTR ODCINKÓW
         if (targetEpisode !== null) {
             if (sub.epStart !== null && sub.epEnd !== null) {
                 if (targetEpisode < sub.epStart || targetEpisode > sub.epEnd) return false;
@@ -620,125 +519,32 @@ function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
 }
 
 function createSubtitleUrl(subtitle, searchQuery, searchType, episode) {
-    const params = new URLSearchParams({
-        id: subtitle.id,
-        hash: subtitle.hash,
-        query: searchQuery,
-        type: searchType
-    });
-    if (episode !== null && episode !== undefined) {
-        params.append('episode', episode);
-    }
+    const params = new URLSearchParams({ id: subtitle.id, hash: subtitle.hash, query: searchQuery, type: searchType });
+    if (episode !== null && episode !== undefined) params.append('episode', episode);
     return `${BASE_URL_RESOLVED}/subtitles/download?${params.toString()}`;
 }
 
-function findLocalSubtitle(title, season, episode) {
-    if (!fs.existsSync(LOCAL_SUBS_DIR)) return null;
-    const files = fs.readdirSync(LOCAL_SUBS_DIR);
-    const cleanTargetTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const titleWords = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
-    
-    for (const file of files) {
-        const ext = path.extname(file).toLowerCase();
-        if (!['.srt', '.ass', '.ssa', '.txt', '.sub'].includes(ext)) continue;
-        const cleanFile = file.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const fileForRegex = file.toLowerCase();
-        
-        // 1. Dopasowanie Tytułu
-        let titleMatch = false;
-        if (cleanFile.includes(cleanTargetTitle)) {
-            titleMatch = true;
-        } else {
-            let matchedWords = 0;
-            for (const word of titleWords) {
-                if (cleanFile.includes(word)) matchedWords++;
-            }
-            if (titleWords.length > 0 && matchedWords >= Math.ceil(titleWords.length / 2)) {
-                titleMatch = true;
-            }
-        }
-        if (!titleMatch) continue;
-        
-        // 2. Dopasowanie Odcinka i Sezonu
-        let episodeMatch = false;
-        if (episode !== null && episode !== undefined) {
-            const epPad = episode.toString().padStart(2, '0');
-            const fileNoRes = fileForRegex.replace(/720p|1080p|480p|2160p/g, '');
-            if (season !== null && season > 1) {
-                const sPad = season.toString().padStart(2, '0');
-                const sRegex = new RegExp(`s${sPad}e${epPad}|season\\s*${season}.*?episode\\s*${episode}`, 'i');
-                if (sRegex.test(fileNoRes)) episodeMatch = true;
-            }
-            if (!episodeMatch) {
-                const epRegex = new RegExp(`(?:[^a-z0-9]|^)e?${epPad}(?:[^a-z0-9]|$)|(?:[^a-z0-9]|^)e?${episode}(?:[^a-z0-9]|$)`, 'i');
-                if (epRegex.test(fileNoRes)) episodeMatch = true;
-            }
-        } else {
-            episodeMatch = true;
-        }
-        if (titleMatch && episodeMatch) {
-            console.log(`[LOCAL] Znaleziono pasujący plik lokalny: ${file}`);
-            const fullPath = path.join(LOCAL_SUBS_DIR, file);
-            return { path: fullPath, file: file };
-        }
-    }
-    return null;
-}
-
 builder.defineSubtitlesHandler(async ({ type, id }) => {
-    console.log(`\n[Request] type=${type}, id=${id}`);
     try {
         const meta = await getMetaInfo(type, id);
-        
-        const localSub = findLocalSubtitle(meta.title, meta.season, meta.episode);
-        if (localSub) {
-            console.log('[LOCAL] Using local subtitle file instead of remote search.');
-            return {
-                subtitles: [{
-                    id: `local-${meta.title}-${meta.episode || ''}`,
-                    url: `${BASE_URL_RESOLVED}/subtitles/local?file=${encodeURIComponent(path.basename(localSub.path))}`,
-                    lang: 'pol',
-                    SubtitleName: `Local: ${path.basename(localSub.path)}`
-                }]
-            };
-        }
-        
-        console.log(`[Meta] title="${meta.title}", season=${meta.season}, episode=${meta.episode}`);
-        if (!meta.title) {
-            console.log('[Błąd] Nie udało się pobrać tytułu');
-            return { subtitles: [] };
-        }
+        if (!meta.title) return { subtitles: [] };
         
         const strategies = generateSearchStrategies(meta.title, meta.season, meta.episode);
         let allSubtitles = [];
         const seenIds = new Set();
         
         for (const strategy of strategies) {
-            console.log(`[Strategia] "${strategy.query}" (${strategy.type})`);
             const results = await searchSubtitles(strategy.query, strategy.type);
             const matched = matchSubtitles(results, meta.season, meta.episode, meta.title);
             for (const sub of matched) {
                 if (!seenIds.has(sub.id)) {
                     seenIds.add(sub.id);
-                    allSubtitles.push({
-                        ...sub,
-                        searchQuery: strategy.query,
-                        searchType: strategy.type
-                    });
+                    allSubtitles.push({ ...sub, searchQuery: strategy.query, searchType: strategy.type });
                 }
             }
-            const exactMatch = matched.some(s =>
-                s.episode === meta.episode &&
-                (meta.season === null || meta.season === 1 || s.season === meta.season)
-            );
-            if (exactMatch && matched.length >= 1) {
-                console.log('[Znaleziono] Dokładne dopasowanie, przerywam wyszukiwanie');
-                break;
-            }
-            if (allSubtitles.length >= 5) {
-                console.log('[Znaleziono] Wystarczająco wyników, przerywam wyszukiwanie');
-                break;
-            }
+            const exactMatch = matched.some(s => s.episode === meta.episode && (meta.season === null || meta.season === 1 || s.season === meta.season));
+            if (exactMatch && matched.length >= 1) break;
+            if (allSubtitles.length >= 5) break;
         }
         
         allSubtitles.sort((a, b) => (b.downloadCount || 0) - (a.downloadCount || 0));
@@ -758,7 +564,6 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
             };
         });
         
-        console.log(`[Wynik] Zwracam ${stremioSubtitles.length} napisów`);
         return { subtitles: stremioSubtitles };
     } catch (error) {
         console.error('[Błąd]', error);
@@ -768,7 +573,6 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
 
 async function downloadSubtitle(req, res) {
     const { id, hash, query, type } = req.query || req.url.searchParams || {};
-    console.log(`[Download] id=${id}, hash=${hash}, query=${query}`);
     if (!id || !hash) {
         res.writeHead(400);
         res.end('Missing parameters');
@@ -786,13 +590,8 @@ async function downloadSubtitle(req, res) {
             responseType: 'arraybuffer',
             withCredentials: true,
         });
-        const searchParams = new URLSearchParams({
-            szukane: query || 'test',
-            pTitle: type || 'org',
-            pSortuj: 'pobrn'
-        });
+        const searchParams = new URLSearchParams({ szukane: query || 'test', pTitle: type || 'org', pSortuj: 'pobrn' });
         const searchUrl = `${SEARCH_URL}?${searchParams.toString()}`;
-        console.log(`[Download] Krok 1: Pobieram stronę wyszukiwania`);
         
         const searchResponse = await downloadSession.get(searchUrl);
         const cookies = searchResponse.headers['set-cookie'] || [];
@@ -805,45 +604,27 @@ async function downloadSubtitle(req, res) {
             const formId = $(form).find('input[name="id"]').val();
             if (formId === id || formId === String(id)) {
                 freshHash = $(form).find('input[name="sh"]').val();
-                console.log(`[Download] ✓ Znaleziono świeży hash dla id=${id}`);
             }
         });
         
-        if (!freshHash) {
-            console.log(`[Download] ✗ Nie znaleziono formularza dla id=${id}, używam oryginalnego hasha`);
-            freshHash = hash;
-        }
+        if (!freshHash) freshHash = hash;
         
-        console.log(`[Download] Krok 2: Pobieram napisy`);
         const downloadResponse = await downloadSession.post(DOWNLOAD_URL,
-            new URLSearchParams({
-                id: id,
-                sh: freshHash,
-                single_file: 'Pobierz napisy'
-            }).toString(),
+            new URLSearchParams({ id: id, sh: freshHash, single_file: 'Pobierz napisy' }).toString(),
             {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Referer': searchUrl,
-                    'Origin': BASE_URL,
-                    'Cookie': cookieString,
-                },
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': searchUrl, 'Origin': BASE_URL, 'Cookie': cookieString },
                 responseType: 'arraybuffer'
             }
         );
         
         let subtitleContent = Buffer.from(downloadResponse.data);
-        console.log(`[Download] Pobrano ${subtitleContent.length} bajtów`);
-        
         const rawText = subtitleContent.toString('latin1');
         if (rawText.includes('zabezpiecze') || rawText.includes('Błąd') || rawText.includes('B³±d')) {
-            console.log(`[Download] ✗ BŁĄD ZABEZPIECZEŃ!`);
             throw new Error('Błąd zabezpieczeń animesub.info - hash nieważny');
         }
         
         let subtitleExtension = '.srt';
         if (subtitleContent[0] === 0x50 && subtitleContent[1] === 0x4B) {
-            console.log('[Download] Rozpakowywanie ZIP...');
             const zip = new AdmZip(subtitleContent);
             const entries = zip.getEntries();
             let subtitleEntry = null;
@@ -851,23 +632,14 @@ async function downloadSubtitle(req, res) {
             
             if (targetEp && targetEp !== 'undefined' && targetEp !== 'null') {
                 const epRegex = new RegExp(`(?:[^a-zA-Z0-9]|^)0*${targetEp}(?:[^a-zA-Z0-9]|$)`, 'i');
-                subtitleEntry = entries.find(e => {
-                    const isSub = /\.(srt|ass|ssa|sub|txt)$/i.test(e.entryName);
-                    const isCorrectEp = epRegex.test(e.entryName);
-                    return isSub && isCorrectEp;
-                });
-                if (subtitleEntry) {
-                    console.log(`[Download] ✓ Znaleziono w paczce odpowiedni odcinek: ${subtitleEntry.entryName}`);
-                }
+                subtitleEntry = entries.find(e => /\.(srt|ass|ssa|sub|txt)$/i.test(e.entryName) && epRegex.test(e.entryName));
             }
             if (!subtitleEntry) {
                 subtitleEntry = entries.find(e => /\.(srt|ass|ssa|sub|txt)$/i.test(e.entryName));
-                console.log(`[Download] ! Wzięto domyślny plik z paczki: ${subtitleEntry ? subtitleEntry.entryName : 'Brak'}`);
             }
             if (subtitleEntry) {
                 subtitleContent = subtitleEntry.getData();
-                subtitleExtension = require('path').extname(subtitleEntry.entryName).toLowerCase() || '.srt';
-                console.log(`[Download] Rozpakowano: ${subtitleEntry.entryName}`);
+                subtitleExtension = path.extname(subtitleEntry.entryName).toLowerCase() || '.srt';
             }
         }
         
@@ -876,51 +648,41 @@ async function downloadSubtitle(req, res) {
         
         if (!utf8Text.includes('\uFFFD')) {
             textContent = utf8Text;
-            console.log('[Download] ✓ Zdekodowano jako UTF-8');
         } else {
             const cp1250Text = iconv.decode(subtitleContent, 'windows-1250');
             const isoText = iconv.decode(subtitleContent, 'ISO-8859-2');
             const plRegex = /[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g;
-            const cp1250Matches = (cp1250Text.match(plRegex) || []).length;
-            const isoMatches = (isoText.match(plRegex) || []).length;
-            if (isoMatches > cp1250Matches) {
+            if ((isoText.match(plRegex) || []).length > (cp1250Text.match(plRegex) || []).length) {
                 textContent = isoText;
-                console.log(`[Download] ✓ Zdekodowano jako ISO-8859-2 (Trafienia: ${isoMatches})`);
             } else {
                 textContent = cp1250Text;
-                console.log(`[Download] ✓ Zdekodowano jako Windows-1250 (Trafienia: ${cp1250Matches})`);
             }
         }
         
         textContent = textContent.replace(/^\uFEFF/, '');
         
         if (subtitleExtension === '.ass' || subtitleExtension === '.ssa') {
-            console.log('[Download] Konwertuję ASS/SSA do SRT...');
             try {
                 const srtContent = convertAssToSrt(textContent);
                 if (srtContent && srtContent.length > 10) {
                     textContent = srtContent;
                     subtitleExtension = '.srt';
-                    console.log(`[Download] ✓ Skonwertowano do SRT`);
                 }
             } catch (convError) {
-                console.error('[Download] Błąd konwersji ASS->SRT:', convError.message);
+                console.error('Błąd konwersji ASS->SRT:', convError.message);
             }
         } else if (subtitleExtension === '.txt' || subtitleExtension === '.sub') {
-            console.log('[Download] Konwertuję TXT/SUB do SRT...');
             try {
                 const srtContent = convertTxtToSrt(textContent);
                 if (srtContent !== textContent) {
                     textContent = srtContent;
                     subtitleExtension = '.srt';
-                    console.log(`[Download] ✓ Skonwertowano TXT do SRT`);
                 }
             } catch (convError) {
-                console.error('[Download] Błąd konwersji TXT->SRT:', convError.message);
+                console.error('Błąd konwersji TXT->SRT:', convError.message);
             }
         }
         
-        console.log(`[Download] ✓ Wysyłam napisy (${textContent.length} znaków)`);
         res.writeHead(200, {
             'Content-Type': 'text/srt; charset=utf-8',
             'Access-Control-Allow-Origin': '*',
@@ -933,47 +695,6 @@ async function downloadSubtitle(req, res) {
         res.writeHead(500);
         res.end('Download failed: ' + error.message);
     }
-}
-
-function serveLocalSubtitle(req, res) {
-    const urlParams = new URL(req.url, `http://localhost:${PORT}`).searchParams;
-    const fileParam = urlParams.get('file');
-    if (!fileParam) {
-        res.writeHead(400);
-        res.end('Missing file param');
-        return;
-    }
-    const file = path.basename(fileParam);
-    const fullPath = path.join(LOCAL_SUBS_DIR, file);
-    if (!fs.existsSync(fullPath)) {
-        res.writeHead(404);
-        res.end('Subtitle not found');
-        return;
-    }
-    let textContent = fs.readFileSync(fullPath, 'utf-8');
-    const ext = path.extname(file).toLowerCase();
-    
-    if (ext === '.ass' || ext === '.ssa') {
-        try {
-            console.log(`[LOCAL] Konwertuję lokalny plik ASS do SRT: ${file}`);
-            textContent = convertAssToSrt(textContent);
-        } catch (e) {
-            console.error('[LOCAL] Błąd konwersji ASS:', e.message);
-        }
-    } else if (ext === '.txt' || ext === '.sub') {
-        try {
-            console.log(`[LOCAL] Konwertuję lokalny plik TXT do SRT: ${file}`);
-            textContent = convertTxtToSrt(textContent);
-        } catch (e) {
-            console.error('[LOCAL] Błąd konwersji TXT:', e.message);
-        }
-    }
-    
-    res.writeHead(200, {
-        'Content-Type': 'text/srt; charset=utf-8',
-        'Access-Control-Allow-Origin': '*'
-    });
-    res.end(textContent);
 }
 
 const PORT = process.env.PORT || 7000;
@@ -989,8 +710,6 @@ if (process.env.BASE_URL) {
 } else {
     BASE_URL_RESOLVED = `http://localhost:${PORT}`;
 }
-
-console.log(`[Config] BASE_URL: ${BASE_URL_RESOLVED}`);
 
 const addonInterface = builder.getInterface();
 const server = http.createServer((req, res) => {
@@ -1014,11 +733,6 @@ const server = http.createServer((req, res) => {
     }
     
     const addonRouter = getRouter(addonInterface);
-    if (url.pathname === '/subtitles/local') {
-        serveLocalSubtitle(req, res);
-        return;
-    }
-    
     addonRouter(req, res, () => {
         res.writeHead(404);
         res.end('Not found');
@@ -1026,19 +740,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`
-╔════════════════════════════════════════════════════════════╗
-║         AnimeSub.info Stremio Addon                        ║
-╠════════════════════════════════════════════════════════════╣
-║  Serwer uruchomiony na: http://localhost:${PORT}              ║
-║                                                            ║
-║  Link do instalacji w Stremio:                             ║
-║  http://localhost:${PORT}/manifest.json                       ║
-║                                                            ║
-║  Aby zainstalować:                                         ║
-║  1. Otwórz Stremio                                         ║
-║  2. Idź do Addons -> Community Addons                      ║
-║  3. Wklej powyższy link w pole "Addon Repository URL"      ║
-╚════════════════════════════════════════════════════════════╝
-`);
+    console.log(`Serwer uruchomiony na porcie ${PORT}`);
 });
