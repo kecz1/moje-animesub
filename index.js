@@ -6,13 +6,16 @@ const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
 
-// Zmienna globalna dla BASE_URL - ustawiana przy starcie serwera
-let BASE_URL_RESOLVED = '';
-const LOCAL_SUBS_DIR = path.join(__dirname, 'my-subs');
+const os = require('os');
+const LOCAL_SUBS_DIR = path.join(os.tmpdir(), 'stremio-my-subs');
 
 if (!fs.existsSync(LOCAL_SUBS_DIR)) {
-    fs.mkdirSync(LOCAL_SUBS_DIR, { recursive: true });
-    console.log(`[Init] Created local subtitles folder: ${LOCAL_SUBS_DIR}`);
+    try {
+        fs.mkdirSync(LOCAL_SUBS_DIR, { recursive: true });
+        console.log(`[Init] Created local subtitles folder: ${LOCAL_SUBS_DIR}`);
+    } catch (err) {
+        console.error('[Init] Nie udało się utworzyć folderu na napisy:', err.message);
+    }
 }
 
 /** * Konwertuje czas SRT na milisekundy (przydatne do filtrowania i cięcia) 
