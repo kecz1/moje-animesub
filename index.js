@@ -8,6 +8,9 @@ const path = require('path');
 
 // Zmienna globalna dla BASE_URL - ustawiana przy starcie serwera
 let BASE_URL_RESOLVED = '';
+// PREFER_ASS=1: napisy ASS/SSA są wysyłane do Stremio w oryginale (z pozycjami i stylami), bez konwersji do SRT.
+// Wymaga włączonej opcji "Style ASS subtitles" w ustawieniach odtwarzacza Stremio.
+const PREFER_ASS = process.env.PREFER_ASS === '1';
 const LOCAL_SUBS_DIR = path.join(__dirname, 'my-subs');
 
 if (!fs.existsSync(LOCAL_SUBS_DIR)) {
@@ -180,132 +183,170 @@ function calculateSimilarity(str1, str2) {
     return (maxLength - distance) / maxLength;
 }
 
-/** * Konwertuje napisy ASS/SSA do formatu SRT z algorytmem cięcia czasu (zapobiega nakładaniu)
+/** Czy wyrównanie ASS (numer) oznacza górę ekranu. SSA (V4) używa innej numeracji niż ASS (V4+). */
+function isTopAlignment(n, isSsa) {
+    if (!n) return false;
+    return isSsa ? (n >= 5 && n <= 8) : (n >= 7 && n <= 9);
+}
+
+/** Zamienia tagi ASS na tekst SRT: zostawia tylko kursywę, resztę usuwa */
+function assTextToSrtText(rawText) {
+    let italicOpen = false;
+    let text = rawText.replace(/\{[^}]*\}/g, block => {
+        const m = block.match(/\\i([01])(?![0-9a-z])/gi);
+        if (m) {
+            const last = m[m.length - 1].endsWith('1');
+            if (last && !italicOpen) { italicOpen = true; return '<i>'; }
+            if (!last && italicOpen) { italicOpen = false; return '</i>'; }
+        }
+        return '';
+    });
+    if (italicOpen) text += '</i>';
+    text = text.replace(/\\N/g, '\n').replace(/\\n/g, '\n').replace(/\\h/g, ' ');
+    return text.split('\n').map(l => l.trim()).filter(Boolean).join('\n').trim();
+}
+
+/**
+ * Konwertuje napisy ASS/SSA do SRT, tak żeby dało się je czytać w odtwarzaczach bez obsługi ASS:
+ *  - wyrzuca napisy "na ekranie" (typesetting: \pos/\move, style Sign/Title/OP/ED, rysunki, karaoke),
+ *    które w SRT zamieniają się w wielki słup tekstu,
+ *  - zostawia same dialogi i łączy nakładające się w jeden blok (bez skakania góra/dół),
+ *  - linie z góry ekranu (\an7-9 lub styl z wyrównaniem na górze) idą w bloku wyżej, zawsze w tej samej kolejności,
+ *  - zachowuje kursywę (<i>).
  */
-function convertAssToSrt(assContent) {
-    const lines = assContent.split('\n');
-    let inEvents = false;
-    let formatFields = [];
-    const rawDialogues = [];
+function convertAssToSrt(assContent, opts = {}) {
+    const MAX_LINES = opts.maxLines || 4;
+    const lines = assContent.replace(/\r/g, '').replace(/^\uFEFF/, '').split('\n');
+    let section = '';
+    let eventFormat = [];
+    let styleFormat = [];
+    const styleTop = {};
+    const dialogues = [];
+    let order = 0;
+    let playResY = 288; // domyślna wartość z libass, gdy plik nie podaje PlayResY
 
-    for (const line of lines) {
-        const trimmedLine = line.trim();
+    const SIGN_STYLE = /sign|typeset|title|credit|eyecatch|logo|screen|note|caption|karaoke|lyric|romaji|kanji|insert|^(op|ed)\b|[ _-](op|ed)\b|\b(op|ed)[ _-]?\d*$/i;
+    const DIALOG_STYLE = /^(default|main|italic|top|narrat|thought|dialog|overlap|flashback|text|speech|internal|radio|phone|tv)/i;
 
-        if (trimmedLine.toLowerCase() === '[events]') {
-            inEvents = true;
-            continue;
-        }
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (line.startsWith('[')) { section = line.toLowerCase(); continue; }
+        const lower = line.toLowerCase();
 
-        if (trimmedLine.startsWith('[') && trimmedLine.toLowerCase() !== '[events]') {
-            inEvents = false;
-            continue;
-        }
-
-        if (!inEvents) continue;
-
-        if (trimmedLine.toLowerCase().startsWith('format:')) {
-            const formatStr = trimmedLine.substring(7).trim();
-            formatFields = formatStr.split(',').map(f => f.trim().toLowerCase());
-            continue;
-        }
-
-        if (trimmedLine.toLowerCase().startsWith('dialogue:')) {
-            const dialogueStr = trimmedLine.substring(9).trim();
-            const parts = [];
-            let current = '';
-            let fieldCount = 0;
-
-            for (let i = 0; i < dialogueStr.length; i++) {
-                const char = dialogueStr[i];
-                if (char === ',' && fieldCount < formatFields.length - 1) {
-                    parts.push(current.trim());
-                    current = '';
-                    fieldCount++;
-                } else {
-                    current += char;
-                }
+        if (section.includes('styles')) {
+            const isSsa = !section.includes('v4+');
+            if (lower.startsWith('format:')) {
+                styleFormat = line.substring(7).split(',').map(f => f.trim().toLowerCase());
+            } else if (lower.startsWith('style:')) {
+                const parts = line.substring(6).split(',').map(x => x.trim());
+                const ni = styleFormat.indexOf('name');
+                const ai = styleFormat.indexOf('alignment');
+                if (ni !== -1 && ai !== -1) styleTop[parts[ni]] = isTopAlignment(parseInt(parts[ai], 10), isSsa);
             }
-            parts.push(current.trim());
-
-            const startIdx = formatFields.indexOf('start');
-            const endIdx = formatFields.indexOf('end');
-            const textIdx = formatFields.indexOf('text');
-
-            if (startIdx === -1 || endIdx === -1 || textIdx === -1) continue;
-            if (parts.length <= Math.max(startIdx, endIdx, textIdx)) continue;
-
-            const rawText = parts[textIdx];
-
-            // Wyłapujemy rysunki wektorowe
-            if (/\{\\p[1-9]\}/i.test(rawText)) continue;
-            
-            const text = stripAssTags(rawText);
-            if (!text) continue;
-            
-            // Filtr śmieci wektorowych
-            if (/^[ml]\s+\-?[\d.]+\s+\-?[\d.]+/i.test(text)) continue;
-
-            const srtStart = assTimeToSrt(parts[startIdx]);
-            const srtEnd = assTimeToSrt(parts[endIdx]);
-
-            const startMs = srtTimeToMs(srtStart);
-            const endMs = srtTimeToMs(srtEnd);
-
-            if (endMs <= startMs) continue;
-            // Filtrujemy znaki wodne (powyżej 60 sekund)
-            if (endMs - startMs > 60000) continue;
-
-            rawDialogues.push({ startMs, endMs, text });
+            continue;
         }
+        if (section.includes('script info')) {
+            if (lower.startsWith('playresy:')) playResY = parseInt(line.substring(9), 10) || playResY;
+            continue;
+        }
+        if (!section.includes('events')) continue;
+
+        if (lower.startsWith('format:')) {
+            eventFormat = line.substring(7).split(',').map(f => f.trim().toLowerCase());
+            continue;
+        }
+        if (!lower.startsWith('dialogue:')) continue;
+
+        const dialogueStr = line.substring(9).trim();
+        const parts = [];
+        let current = '';
+        for (let i = 0; i < dialogueStr.length; i++) {
+            const ch = dialogueStr[i];
+            if (ch === ',' && parts.length < eventFormat.length - 1) {
+                parts.push(current.trim());
+                current = '';
+            } else {
+                current += ch;
+            }
+        }
+        parts.push(current.trim());
+
+        const startIdx = eventFormat.indexOf('start');
+        const endIdx = eventFormat.indexOf('end');
+        const textIdx = eventFormat.indexOf('text');
+        const styleIdx = eventFormat.indexOf('style');
+        if (startIdx === -1 || endIdx === -1 || textIdx === -1) continue;
+        if (parts.length <= Math.max(startIdx, endIdx, textIdx)) continue;
+
+        const rawText = parts[textIdx];
+        const styleName = styleIdx !== -1 ? parts[styleIdx] : '';
+
+        // Rysunki wektorowe (\p1...) i karaoke (wiele \k) - nieczytelne w SRT
+        if (/\\p[1-9](?![0-9a-z])/i.test(rawText)) continue;
+        if ((rawText.match(/\\k[fo]?\d+/gi) || []).length >= 3) continue;
+
+        // Typesetting: napisy "przyklejone" do miejsca na ekranie
+        const hasPos = /\\(pos|move)\s*\(/i.test(rawText);
+        if (SIGN_STYLE.test(styleName)) continue;
+        if (/\\move\s*\(/i.test(rawText)) continue; // animowane napisy na ekranie
+        if (hasPos) {
+            if (!DIALOG_STYLE.test(styleName)) continue;
+            // \pos w górnej części kadru = napis w scenie, nie dialog
+            const pm = rawText.match(/\\pos\s*\(\s*-?[\d.]+\s*,\s*(-?[\d.]+)/i);
+            if (pm && parseFloat(pm[1]) / playResY < 0.55) continue;
+        }
+
+        const text = assTextToSrtText(rawText);
+        if (!text) continue;
+        if (/^[ml]\s+-?[\d.]+\s+-?[\d.]+/i.test(text)) continue;
+
+        const startMs = srtTimeToMs(assTimeToSrt(parts[startIdx]));
+        const endMs = srtTimeToMs(assTimeToSrt(parts[endIdx]));
+        if (endMs <= startMs) continue;
+        if (endMs - startMs > 60000) continue; // znaki wodne
+
+        const an = rawText.match(/\\an([1-9])/i);
+        const top = an ? parseInt(an[1], 10) >= 7 : !!styleTop[styleName];
+
+        dialogues.push({ startMs, endMs, text, top, order: order++ });
     }
 
-    // Algorytm cięcia linii czasu
+    // Cięcie osi czasu: jeden blok = jeden zestaw aktywnych linii
     const timePoints = new Set();
-    rawDialogues.forEach(d => {
-        timePoints.add(d.startMs);
-        timePoints.add(d.endMs);
-    });
-
-    const sortedTimes = Array.from(timePoints).sort((a, b) => a - b);
-    const slicedBlocks = [];
+    dialogues.forEach(d => { timePoints.add(d.startMs); timePoints.add(d.endMs); });
+    const sortedTimes = Array.from(timePoints).sort((x, y) => x - y);
+    const blocks = [];
 
     for (let i = 0; i < sortedTimes.length - 1; i++) {
         const start = sortedTimes[i];
         const end = sortedTimes[i + 1];
         if (start === end) continue;
 
-        const activeTexts = rawDialogues
+        const active = dialogues
             .filter(d => d.startMs <= start && d.endMs >= end)
-            .map(d => d.text);
+            // góra ekranu najpierw, potem dół; w grupie wg czasu startu i kolejności w pliku
+            .sort((x, y) => (y.top - x.top) || (x.startMs - y.startMs) || (x.order - y.order));
+        if (!active.length) continue;
 
-        if (activeTexts.length > 0) {
-            const uniqueTexts = [...new Set(activeTexts)];
-            slicedBlocks.push({ startMs: start, endMs: end, text: uniqueTexts.join('\n') });
+        const texts = [...new Set(active.map(d => d.text))].slice(0, MAX_LINES);
+        blocks.push({ startMs: start, endMs: end, text: texts.join('\n') });
+    }
+
+    // Scalanie sąsiednich identycznych bloków i wygładzanie mikro-przeskoków (<120 ms)
+    const merged = [];
+    for (const block of blocks) {
+        const last = merged[merged.length - 1];
+        if (last && last.endMs === block.startMs) {
+            if (last.text === block.text) { last.endMs = block.endMs; continue; }
+            if (block.endMs - block.startMs < 120) { last.endMs = block.endMs; continue; }
         }
+        merged.push({ ...block });
     }
 
-    // Optymalizacja przyległych klatek
-    const optimizedBlocks = [];
-    for (const block of slicedBlocks) {
-        if (optimizedBlocks.length > 0) {
-            const lastBlock = optimizedBlocks[optimizedBlocks.length - 1];
-            if (lastBlock.text === block.text && lastBlock.endMs === block.startMs) {
-                lastBlock.endMs = block.endMs;
-                continue;
-            }
-        }
-        optimizedBlocks.push(block);
-    }
-
-    let srt = '';
-    for (let i = 0; i < optimizedBlocks.length; i++) {
-        const d = optimizedBlocks[i];
-        srt += `${i + 1}\n`;
-        srt += `${formatSrtTime(d.startMs)} --> ${formatSrtTime(d.endMs)}\n`;
-        srt += `${d.text}\n\n`;
-    }
-
-    return srt.trim();
+    return merged
+        .map((d, i) => `${i + 1}\n${formatSrtTime(d.startMs)} --> ${formatSrtTime(d.endMs)}\n${d.text}`)
+        .join('\n\n');
 }
 
 // Konfiguracja
@@ -316,9 +357,9 @@ const DOWNLOAD_URL = `${BASE_URL}/sciagnij.php`;
 // Manifest wtyczki
 const manifest = {
     id: 'community.animesub.info',
-    version: '1.0.0',
-    name: 'AnimeSub.info Subtitles',
-    description: 'Polskie napisy do anime z animesub.info',
+    version: '1.1.0',
+    name: 'Polskie napisy do anime (fansuby + AnimeSub.info)',
+    description: 'Polskie napisy do anime z fansuby.cc oraz animesub.info',
     logo: 'https://i.imgur.com/qKLYVZx.png',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -626,7 +667,14 @@ function createSubtitleUrl(subtitle, searchQuery, searchType, episode) {
     if (episode !== null && episode !== undefined) {
         params.append('episode', episode);
     }
-    return `${BASE_URL_RESOLVED}/subtitles/download?${params.toString()}`;
+    // Przy PREFER_ASS Stremio rozpoznaje ASS po rozszerzeniu w ścieżce URL
+    let pathExt = '';
+    if (PREFER_ASS) {
+        const fmt = String(subtitle.formatType || '');
+        if (/\bssa\b/i.test(fmt)) pathExt = `/${subtitle.id}.ssa`;
+        else if (/\bass\b/i.test(fmt)) pathExt = `/${subtitle.id}.ass`;
+    }
+    return `${BASE_URL_RESOLVED}/subtitles/download${pathExt}?${params.toString()}`;
 }
 
 function findLocalSubtitle(title, season, episode) {
@@ -682,12 +730,254 @@ function findLocalSubtitle(title, season, episode) {
     return null;
 }
 
-builder.defineSubtitlesHandler(async ({ type, id }) => {
+// ============================================================
+// FANSUBY.CC (https://fansuby.cc/api/v1) - główne źródło napisów
+// Klucz API ustaw w zmiennej środowiskowej FANSUBY_KEY (Render -> Environment)
+// ============================================================
+const FANSUBY_API = (process.env.FANSUBY_URL || 'https://fansuby.cc') + '/api/v1';
+const FANSUBY_KEY = process.env.FANSUBY_KEY || '';
+const fsb = axios.create({
+    headers: { Authorization: `Bearer ${FANSUBY_KEY}` },
+    timeout: 10000
+});
+const kitsuMapCache = new Map();
+const fansubyCache = new Map();
+const FANSUBY_CACHE_TTL = 5 * 60 * 1000;
+
+/** Kitsu ID -> AniList / MAL ID (fansuby szuka po tych identyfikatorach) */
+async function kitsuMappings(kitsuId) {
+    if (kitsuMapCache.has(kitsuId)) return kitsuMapCache.get(kitsuId);
+    const out = {};
+    try {
+        const r = await axios.get(
+            `https://kitsu.io/api/edge/anime/${kitsuId}/mappings`,
+            { params: { 'page[limit]': 20 }, headers: { Accept: 'application/vnd.api+json' }, timeout: 5000 }
+        );
+        for (const m of r.data.data) {
+            if (m.attributes.externalSite === 'anilist/anime') out.anilistId = m.attributes.externalId;
+            if (m.attributes.externalSite === 'myanimelist/anime') out.malId = m.attributes.externalId;
+        }
+        kitsuMapCache.set(kitsuId, out);
+    } catch (e) {
+        console.error('[Kitsu mappings]', e.message);
+    }
+    return out;
+}
+
+/** Szuka napisów w fansuby przez /match i zwraca listę w formacie Stremio */
+async function fansubySubtitles(meta, extra) {
+    if (!FANSUBY_KEY) return [];
+
+    const params = { format: 'srt', lang: 'pl' };
+    const ep = String(meta.episode ?? 1).padStart(2, '0');
+
+    if (extra && extra.filename) {
+        params.filename = extra.filename;
+    } else if (meta.title) {
+        params.filename = (meta.kitsuId || !meta.season)
+            ? `${meta.title} - ${ep}.mkv`
+            : `${meta.title}.S${String(meta.season).padStart(2, '0')}E${ep}.mkv`;
+    } else {
+        return [];
+    }
+
+    if (meta.kitsuId) {
+        const ids = await kitsuMappings(meta.kitsuId);
+        if (ids.anilistId) params.anilistId = ids.anilistId;
+        else if (ids.malId) params.malId = ids.malId;
+        if (meta.episode !== null && meta.episode !== undefined) params.episode = meta.episode;
+    }
+
+    const cacheKey = JSON.stringify(params);
+    const cached = fansubyCache.get(cacheKey);
+    if (cached && Date.now() - cached.time < FANSUBY_CACHE_TTL) return cached.data;
+
+    console.log(`[Fansuby] /match`, params);
+    const r = await fsb.get(`${FANSUBY_API}/match`, { params, validateStatus: s => s < 500 });
+    if (r.status === 429) {
+        console.warn(`[Fansuby] 429 rate limit, Retry-After=${r.headers['retry-after']}`);
+        return [];
+    }
+    if (r.status !== 200) {
+        console.log(`[Fansuby] status ${r.status}`);
+        return [];
+    }
+
+    const preferAss = PREFER_ASS;
+    const data = [];
+    for (const s of (r.data.data || []).slice(0, 6)) {
+        const label = [
+            'fansuby',
+            s.releaseGroup,
+            s.resolution,
+            s.credits && s.credits.length ? `by ${s.credits[0].name}` : null
+        ].filter(Boolean).join(' | ');
+        const entry = (suffix, ext) => ({
+            id: `fansuby-${s.id}-${ext}`,
+            url: `${BASE_URL_RESOLVED}/subtitles/fansuby/${s.id}.${ext}`,
+            lang: 'pol',
+            label: `${label} | ${suffix}`,
+            SubtitleName: `${label} | ${suffix}`
+        });
+        const srtEntry = entry('SRT', 'srt');
+        if (s.format === 'ass') {
+            // oryginalny ASS zachowuje pozycje i style (wymaga "Style ASS subtitles" w ustawieniach Stremio)
+            const assEntry = entry('ASS (stylizowane)', 'ass');
+            if (preferAss) data.push(assEntry, srtEntry); else data.push(srtEntry, assEntry);
+        } else {
+            data.push(srtEntry);
+        }
+    }
+    fansubyCache.set(cacheKey, { time: Date.now(), data });
+    console.log(`[Fansuby] Znaleziono ${data.length} napisów`);
+    return data;
+}
+
+/** Dekoduje bufor napisów: UTF-8, a przy błędach Windows-1250 / ISO-8859-2 */
+function decodeSubtitleBuffer(buf) {
+    const utf8Text = buf.toString('utf-8');
+    let text;
+    if (!utf8Text.includes('\uFFFD')) {
+        text = utf8Text;
+    } else {
+        const cp1250Text = iconv.decode(buf, 'windows-1250');
+        const isoText = iconv.decode(buf, 'ISO-8859-2');
+        const plRegex = /[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g;
+        const cp1250Matches = (cp1250Text.match(plRegex) || []).length;
+        const isoMatches = (isoText.match(plRegex) || []).length;
+        text = isoMatches > cp1250Matches ? isoText : cp1250Text;
+    }
+    return text.replace(/^\uFEFF/, '');
+}
+
+/** Konwertuje WebVTT do SRT */
+function convertVttToSrt(vtt) {
+    const blocks = vtt.replace(/\r/g, '').split(/\n{2,}/);
+    const out = [];
+    for (const block of blocks) {
+        const lines = block.split('\n');
+        const idx = lines.findIndex(l => l.includes('-->'));
+        if (idx === -1) continue; // nagłówek WEBVTT, NOTE, STYLE
+        let time = lines[idx].replace(/\s+(align|position|line|size):\S+/g, '');
+        time = time.replace(/(^|\s)(\d{2}:\d{2})\.(\d{3})/g, '$100:$2.$3')
+                   .replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, '$1,$2');
+        out.push(`${out.length + 1}\n${time}\n${lines.slice(idx + 1).join('\n')}`);
+    }
+    return out.join('\n\n');
+}
+
+/** Jeśli bufor to ZIP (sygnatura "PK"), zwraca pierwszy plik z napisami; inaczej oddaje bufor bez zmian */
+function unwrapZip(buf) {
+    if (buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b) {
+        try {
+            const zip = new AdmZip(buf);
+            const entry = zip.getEntries().find(e => !e.isDirectory && /\.(srt|ass|ssa|vtt|sub|txt)$/i.test(e.entryName));
+            if (entry) return entry.getData();
+        } catch (e) {
+            console.error('[Normalize] Błąd rozpakowywania ZIP:', e.message);
+        }
+    }
+    return buf;
+}
+
+/**
+ * Przyjmuje dowolny plik napisów (ZIP, ASS/SSA, SRT, VTT, MicroDVD, MPL2, TMPlayer)
+ * i zawsze zwraca tekst w formacie SRT. Format wykrywa po zawartości, nie po rozszerzeniu.
+ */
+function normalizeToSrt(buf) {
+    buf = unwrapZip(buf);
+
+    const text = decodeSubtitleBuffer(buf);
+
+    // ASS / SSA
+    if (/^\s*\[Script Info\]/im.test(text) || /^\s*\[Events\]/im.test(text) || /^Dialogue:/m.test(text)) {
+        try {
+            const srt = convertAssToSrt(text);
+            if (srt && srt.length > 10) return srt;
+        } catch (e) {
+            console.error('[Normalize] Błąd ASS->SRT:', e.message);
+        }
+        return text;
+    }
+    // WebVTT
+    if (/^WEBVTT/i.test(text.trim())) {
+        return convertVttToSrt(text);
+    }
+    // SRT (już gotowy)
+    if (text.includes('-->')) {
+        return text;
+    }
+    // MicroDVD / MPL2 / TMPlayer
+    try {
+        return convertTxtToSrt(text);
+    } catch (e) {
+        console.error('[Normalize] Błąd TXT->SRT:', e.message);
+        return text;
+    }
+}
+
+const fansubyFileCache = new Map();
+
+/** Pobiera plik z fansuby (z krótkim cache, żeby ASS+SRT nie liczyły się podwójnie do limitu pobrań) */
+async function getFansubyFile(id) {
+    const cached = fansubyFileCache.get(id);
+    if (cached && Date.now() - cached.time < 10 * 60 * 1000) return cached.buf;
+    const r = await fsb.get(`${FANSUBY_API}/subtitles/${id}/download`, {
+        responseType: 'arraybuffer',
+        maxRedirects: 5
+    });
+    const buf = Buffer.from(r.data);
+    fansubyFileCache.set(id, { time: Date.now(), buf });
+    if (fansubyFileCache.size > 50) fansubyFileCache.delete(fansubyFileCache.keys().next().value);
+    return buf;
+}
+
+/** Proxy pobierania - klucz API zostaje po stronie serwera. /subtitles/fansuby/{id}.ass | .srt */
+async function serveFansuby(req, res, url) {
+    let id = url.searchParams.get('id');
+    let mode = url.searchParams.get('as') || 'srt';
+    const m = url.pathname.match(/^\/subtitles\/fansuby\/(\d+)\.(ass|srt)$/);
+    if (m) { id = m[1]; mode = m[2]; }
+    if (!/^\d+$/.test(id || '')) {
+        res.writeHead(400);
+        res.end('Bad id');
+        return;
+    }
+    try {
+        const buf = await getFansubyFile(id);
+        let body;
+        let contentType = 'text/srt; charset=utf-8';
+        if (mode === 'ass') {
+            const text = decodeSubtitleBuffer(unwrapZip(buf));
+            if (/^\s*\[Script Info\]/im.test(text) || /^\s*\[Events\]/im.test(text)) {
+                body = text; // oryginał, bez żadnej konwersji - Stremio sam renderuje style
+                contentType = 'text/x-ssa; charset=utf-8';
+            } else {
+                body = normalizeToSrt(buf);
+            }
+        } else {
+            body = normalizeToSrt(buf);
+        }
+        res.writeHead(200, { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' });
+        res.end(body);
+    } catch (e) {
+        const status = (e.response && e.response.status) || 500;
+        console.error('[Fansuby Download]', status, e.message);
+        const headers = {};
+        if (e.response && e.response.headers && e.response.headers['retry-after']) {
+            headers['Retry-After'] = e.response.headers['retry-after'];
+        }
+        res.writeHead(status, headers);
+        res.end('Download failed');
+    }
+}
+
+builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
     console.log(`\n[Request] type=${type}, id=${id}`);
     try {
         const meta = await getMetaInfo(type, id);
         
-        const localSub = findLocalSubtitle(meta.title, meta.season, meta.episode);
+        const localSub = meta.title ? findLocalSubtitle(meta.title, meta.season, meta.episode) : null;
         if (localSub) {
             console.log('[LOCAL] Using local subtitle file instead of remote search.');
             return {
@@ -700,6 +990,16 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
             };
         }
         
+        // Główne źródło: fansuby.cc (animesub.info jako fallback)
+        try {
+            const fansubySubs = await fansubySubtitles(meta, extra);
+            if (fansubySubs.length) {
+                return { subtitles: fansubySubs };
+            }
+        } catch (e) {
+            console.error('[Fansuby] Błąd:', e.message);
+        }
+
         console.log(`[Meta] title="${meta.title}", season=${meta.season}, episode=${meta.episode}`);
         if (!meta.title) {
             console.log('[Błąd] Nie udało się pobrać tytułu');
@@ -751,6 +1051,7 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
                 id: `animesub-${sub.id}`,
                 url: createSubtitleUrl(sub, sub.searchQuery, sub.searchType, meta.episode),
                 lang: 'pol',
+                label,
                 SubtitleName: label
             };
         });
@@ -891,6 +1192,19 @@ async function downloadSubtitle(req, res) {
         
         textContent = textContent.replace(/^\uFEFF/, '');
         
+        const looksLikeAss = /^\s*\[Script Info\]/im.test(textContent) || /^\s*\[Events\]/im.test(textContent);
+        if (PREFER_ASS && (subtitleExtension === '.ass' || subtitleExtension === '.ssa' || looksLikeAss)) {
+            console.log('[Download] PREFER_ASS=1 - wysyłam oryginalny ASS/SSA bez konwersji');
+            res.writeHead(200, {
+                'Content-Type': 'text/x-ssa; charset=utf-8',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type'
+            });
+            res.end(textContent);
+            return;
+        }
+
         if (subtitleExtension === '.ass' || subtitleExtension === '.ssa') {
             console.log('[Download] Konwertuję ASS/SSA do SRT...');
             try {
@@ -977,7 +1291,9 @@ const PORT = process.env.PORT || 7000;
 const http = require('http');
 
 if (process.env.BASE_URL) {
-    BASE_URL_RESOLVED = process.env.BASE_URL;
+    BASE_URL_RESOLVED = process.env.BASE_URL.replace(/\/$/, '');
+} else if (process.env.RENDER_EXTERNAL_URL) {
+    BASE_URL_RESOLVED = process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
 } else if (process.env.SPACE_HOST) {
     BASE_URL_RESOLVED = `https://${process.env.SPACE_HOST}`;
 } else if (process.env.SPACE_ID) {
@@ -1004,7 +1320,18 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    if (url.pathname === '/subtitles/download') {
+    if (url.pathname === '/subtitles/fansuby' || url.pathname.startsWith('/subtitles/fansuby/')) {
+        serveFansuby(req, res, url);
+        return;
+    }
+
+    if (url.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+        return;
+    }
+
+    if (url.pathname === '/subtitles/download' || /^\/subtitles\/download\/[^/]+\.(ass|ssa)$/i.test(url.pathname)) {
         req.query = Object.fromEntries(url.searchParams);
         downloadSubtitle(req, res);
         return;
