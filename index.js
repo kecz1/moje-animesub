@@ -657,7 +657,7 @@ function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
     });
 }
 
-function createSubtitleUrl(subtitle, searchQuery, searchType, episode) {
+function createSubtitleUrl(subtitle, searchQuery, searchType, episode, lite = false) {
     const params = new URLSearchParams({
         id: subtitle.id,
         hash: subtitle.hash,
@@ -667,6 +667,7 @@ function createSubtitleUrl(subtitle, searchQuery, searchType, episode) {
     if (episode !== null && episode !== undefined) {
         params.append('episode', episode);
     }
+    if (lite) params.append('lite', '1');
     // Przy PREFER_ASS Stremio rozpoznaje ASS po rozszerzeniu w ścieżce URL
     let pathExt = '';
     if (PREFER_ASS) {
@@ -812,9 +813,9 @@ async function fansubySubtitles(meta, extra) {
             s.resolution,
             s.credits && s.credits.length ? `by ${s.credits[0].name}` : null
         ].filter(Boolean).join(' | ');
-        const entry = (suffix, ext) => ({
-            id: `fansuby-${s.id}-${ext}`,
-            url: `${BASE_URL_RESOLVED}/subtitles/fansuby/${s.id}.${ext}`,
+        const entry = (suffix, ext, query = '') => ({
+            id: `fansuby-${s.id}-${ext}${query ? '-lite' : ''}`,
+            url: `${BASE_URL_RESOLVED}/subtitles/fansuby/${s.id}.${ext}${query}`,
             lang: 'pol',
             label: `${label} | ${suffix}`,
             SubtitleName: `${label} | ${suffix}`
@@ -822,8 +823,10 @@ async function fansubySubtitles(meta, extra) {
         const srtEntry = entry('SRT', 'srt');
         if (s.format === 'ass') {
             // oryginalny ASS zachowuje pozycje i style (wymaga "Style ASS subtitles" w ustawieniach Stremio)
-            const assEntry = entry('ASS (stylizowane)', 'ass');
-            if (preferAss) data.push(assEntry, srtEntry); else data.push(srtEntry, assEntry);
+            const assEntry = entry('ASS (stylizowane)', 'ass');  // bez parametru: wybór automatyczny wg urządzenia
+            // wersja bez rysunków wektorowych - dla odtwarzaczy, które wypisują je jako tekst
+            const liteEntry = entry('ASS (uproszczone)', 'ass', '?lite=1');
+            if (preferAss) data.push(assEntry, liteEntry, srtEntry); else data.push(srtEntry, assEntry, liteEntry);
         } else {
             data.push(srtEntry);
         }
@@ -831,6 +834,37 @@ async function fansubySubtitles(meta, extra) {
     fansubyCache.set(cacheKey, { time: Date.now(), data });
     console.log(`[Fansuby] Znaleziono ${data.length} napisów`);
     return data;
+}
+
+/**
+ * Czy dla tego żądania wysłać ASS bez rysunków wektorowych?
+ * - ?lite=1 wymusza wersję uproszczoną, ?lite=0 pełną,
+ * - bez parametru decyduje User-Agent: telefony, tablety i telewizory (Android, ExoPlayer, okhttp, iOS, Tizen, webOS)
+ *   dostają wersję uproszczoną, komputery pełną. Wyłączenie automatu: ASS_AUTO_LITE=0.
+ */
+const MOBILE_UA = /android|dalvik|exoplayer|okhttp|iphone|ipad|ipod|cfnetwork|\bios\b|mobile|tizen|webos/i;
+function wantsLiteAss(req, liteParam) {
+    const ua = (req.headers && req.headers['user-agent']) || '';
+    console.log(`[ASS] User-Agent: "${ua}", lite=${liteParam || 'auto'}`);
+    if (liteParam === '1') return true;
+    if (liteParam === '0') return false;
+    if (process.env.ASS_AUTO_LITE === '0') return false;
+    const lite = MOBILE_UA.test(ua);
+    console.log(`[ASS] Wykryto urządzenie: ${lite ? 'mobilne -> ASS uproszczony' : 'komputer -> ASS pełny'}`);
+    return lite;
+}
+
+/**
+ * Usuwa z ASS zdarzenia z rysunkami wektorowymi (\p1...). Biblioteka libass (komputer) rysuje je poprawnie,
+ * ale prostsze renderery (np. część aplikacji mobilnych) wypisują komendy typu "m 10 20 l 30 40" jako tekst.
+ * Pozycje, kolory i style dialogów zostają bez zmian.
+ */
+function stripAssDrawings(assText) {
+    return assText
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter(line => !(/^\s*dialogue:/i.test(line) && /\\p[1-9](?![0-9a-z])/i.test(line)))
+        .join('\n');
 }
 
 /** Dekoduje bufor napisów: UTF-8, a przy błędach Windows-1250 / ISO-8859-2 */
@@ -950,7 +984,8 @@ async function serveFansuby(req, res, url) {
         if (mode === 'ass') {
             const text = decodeSubtitleBuffer(unwrapZip(buf));
             if (/^\s*\[Script Info\]/im.test(text) || /^\s*\[Events\]/im.test(text)) {
-                body = text; // oryginał, bez żadnej konwersji - Stremio sam renderuje style
+                // oryginał (lub wersja bez rysunków przy ?lite=1) - Stremio sam renderuje style
+                body = wantsLiteAss(req, url.searchParams.get('lite')) ? stripAssDrawings(text) : text;
                 contentType = 'text/x-ssa; charset=utf-8';
             } else {
                 body = normalizeToSrt(buf);
@@ -1040,20 +1075,32 @@ builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
         
         allSubtitles.sort((a, b) => (b.downloadCount || 0) - (a.downloadCount || 0));
         
-        const stremioSubtitles = allSubtitles.slice(0, 10).map(sub => {
+        const stremioSubtitles = allSubtitles.slice(0, 10).flatMap(sub => {
             const label = [
                 sub.titleEng || sub.titleOrg,
                 sub.author ? `by ${sub.author}` : null,
                 sub.formatType,
                 sub.downloadCount ? `${sub.downloadCount} pobrań` : null
             ].filter(Boolean).join(' | ');
-            return {
+            const items = [{
                 id: `animesub-${sub.id}`,
                 url: createSubtitleUrl(sub, sub.searchQuery, sub.searchType, meta.episode),
                 lang: 'pol',
                 label,
                 SubtitleName: label
-            };
+            }];
+            // PREFER_ASS: obok oryginalnego ASS dajemy wersję bez rysunków wektorowych
+            if (PREFER_ASS && /\b(ass|ssa)\b/i.test(String(sub.formatType || ''))) {
+                const liteLabel = `${label} | uproszczone`;
+                items.push({
+                    id: `animesub-${sub.id}-lite`,
+                    url: createSubtitleUrl(sub, sub.searchQuery, sub.searchType, meta.episode, true),
+                    lang: 'pol',
+                    label: liteLabel,
+                    SubtitleName: liteLabel
+                });
+            }
+            return items;
         });
         
         console.log(`[Wynik] Zwracam ${stremioSubtitles.length} napisów`);
@@ -1201,7 +1248,7 @@ async function downloadSubtitle(req, res) {
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                 'Access-Control-Allow-Headers': 'Content-Type'
             });
-            res.end(textContent);
+            res.end(wantsLiteAss(req, req.query.lite) ? stripAssDrawings(textContent) : textContent);
             return;
         }
 
