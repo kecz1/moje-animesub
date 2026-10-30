@@ -357,9 +357,9 @@ const DOWNLOAD_URL = `${BASE_URL}/sciagnij.php`;
 // Manifest wtyczki
 const manifest = {
     id: 'community.animesub.info',
-    version: '1.2.0',
-    name: 'Polskie napisy do anime (fansuby + KickAss + AnimeSub.info)',
-    description: 'Polskie napisy do anime z fansuby.cc, kickasssubtitles.com oraz animesub.info',
+    version: '1.1.0',
+    name: 'Polskie napisy do anime (fansuby + AnimeSub.info)',
+    description: 'Polskie napisy do anime z fansuby.cc oraz animesub.info',
     logo: 'https://i.imgur.com/qKLYVZx.png',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -782,17 +782,11 @@ async function fansubySubtitles(meta, extra) {
         return [];
     }
 
-    const hasEpisode = meta.episode !== null && meta.episode !== undefined;
-    // Fansuby to serwis anime: /match bez numeru odcinka zwraca 400, więc zwykłych filmów (tt...) nie odpytujemy
-    if (!meta.kitsuId && !hasEpisode && !(meta.season !== null && meta.season !== undefined)) {
-        console.log('[Fansuby] Pomijam - to film bez numeru odcinka');
-        return [];
-    }
     if (meta.kitsuId) {
         const ids = await kitsuMappings(meta.kitsuId);
         if (ids.anilistId) params.anilistId = ids.anilistId;
         else if (ids.malId) params.malId = ids.malId;
-        params.episode = hasEpisode ? meta.episode : 1; // film anime z Kitsu = odcinek 1
+        if (meta.episode !== null && meta.episode !== undefined) params.episode = meta.episode;
     }
 
     const cacheKey = JSON.stringify(params);
@@ -956,123 +950,6 @@ function normalizeToSrt(buf) {
     }
 }
 
-// ============================================================
-// KICKASSSUBTITLES.COM (https://kickasssubtitles.com/api)
-// Klucz API ustaw w zmiennej środowiskowej KICKASS_KEY (Render -> Environment)
-// Wyszukiwanie jest asynchroniczne: POST /search -> id zadania -> GET /tasks/{id} -> napisy w base64.
-// Szuka po nazwie pliku / rozmiarze / hashu wideo, które przekazuje Stremio (extra.filename, videoSize, videoHash).
-// ============================================================
-const KICKASS_API = (process.env.KICKASS_URL || 'https://kickasssubtitles.com') + '/api';
-const KICKASS_KEY = process.env.KICKASS_KEY || '';
-const KICKASS_WAIT_MS = parseInt(process.env.KICKASS_TIMEOUT_MS, 10) || 6500; // ile czekamy na wynik przy odpowiedzi do Stremio
-const KICKASS_TTL = 30 * 60 * 1000;
-// Kickasssubtitles: tylko polski (kody serwisu -> kody Stremio)
-const KICKASS_LANG_CODES = { pl: 'pol' };
-const KICKASS_LANGS = ['pl'];
-const kickassHttp = axios.create({
-    baseURL: KICKASS_API,
-    headers: { Accept: 'application/json', Authorization: `Bearer ${KICKASS_KEY}` },
-    timeout: 10000
-});
-const kickassSearches = new Map(); // klucz wideo -> { time, promise }
-const kickassFiles = new Map();    // id pliku -> { time, buf }
-const delay = (ms, value) => new Promise(resolve => setTimeout(() => resolve(value), ms));
-
-function kickassStoreFile(id, buf) {
-    const now = Date.now();
-    for (const [k, v] of kickassFiles) if (now - v.time > KICKASS_TTL) kickassFiles.delete(k);
-    kickassFiles.set(id, { time: now, buf });
-    if (kickassFiles.size > 200) kickassFiles.delete(kickassFiles.keys().next().value);
-}
-
-async function kickassSearch(filename, filesize, hash, lang) {
-    const form = new URLSearchParams();
-    if (filename) form.append('filename', filename);
-    if (filesize) form.append('filesize', String(filesize));
-    if (hash) form.append('hashes[opensubtitles]', hash);
-    form.append('language', lang);
-    form.append('encoding', 'UTF-8');
-    form.append('format', 'subrip');
-
-    console.log(`[KickAss] POST /search lang=${lang} filename="${filename || ''}" size=${filesize || ''} hash=${hash || ''}`);
-    const r = await kickassHttp.post('/search', form, { validateStatus: st => st < 500 });
-    if (r.status === 401 || r.status === 403) { console.error('[KickAss] Błąd autoryzacji - sprawdź KICKASS_KEY'); return []; }
-    if (r.status === 429) { console.warn('[KickAss] 429 - limit zapytań'); return []; }
-    if (r.status >= 300 || !r.data || !r.data.id) { console.log(`[KickAss] /search status ${r.status}: ${JSON.stringify(r.data).slice(0, 600)}`); return []; }
-
-    const taskId = r.data.id;
-    let task = r.data;
-    const deadline = Date.now() + 25000; // zadanie dalej liczymy w tle, nawet gdy Stremio nie czeka
-    while (task.status !== 'completed' && Date.now() < deadline) {
-        if (['failed', 'error', 'cancelled'].includes(task.status)) { console.log(`[KickAss] Zadanie ${task.status}: ${JSON.stringify(task).slice(0, 800)}`); return []; }
-        await delay(1000);
-        const t = await kickassHttp.get(`/tasks/${encodeURIComponent(taskId)}`, { validateStatus: st => st < 500 });
-        if (t.status >= 300 || !t.data) return [];
-        task = t.data;
-    }
-    if (task.status !== 'completed') { console.log(`[KickAss] Zadanie nie zdążyło się zakończyć: ${JSON.stringify(task).slice(0, 400)}`); return []; }
-
-    const subs = (task.result && task.result.subtitles) || [];
-    const out = [];
-    subs.slice(0, 5).forEach((sub, i) => {
-        if (!sub.contents_base64) return;
-        const ext = /^[a-z0-9]{2,4}$/i.test(sub.extension || '') ? sub.extension.toLowerCase() : 'srt';
-        const fileId = `${lang}-${String(taskId).replace(/[^A-Za-z0-9_-]/g, '')}-${i}`;
-        kickassStoreFile(fileId, Buffer.from(sub.contents_base64, 'base64'));
-        const label = `kickasssubtitles | ${lang.toUpperCase()} | ${ext.toUpperCase()}${subs.length > 1 ? ` | #${i + 1}` : ''}`;
-        out.push({
-            id: `kickass-${fileId}`,
-            url: `${BASE_URL_RESOLVED}/subtitles/kickass/${fileId}.${ext}`,
-            lang: KICKASS_LANG_CODES[lang],
-            label,
-            SubtitleName: label
-        });
-    });
-    console.log(`[KickAss] (${lang}) Znaleziono ${out.length} napisów`);
-    if (!out.length) console.log(`[KickAss] Odpowiedź bez napisów: ${JSON.stringify(task).slice(0, 600)}`);
-    return out;
-}
-
-/** Wyszukiwanie z cache (osobno dla każdego języka); obietnice żyją w tle, więc kolejne zapytanie Stremio dostaje gotowy wynik */
-function kickassFetch(extra) {
-    if (!KICKASS_KEY || !extra || !KICKASS_LANGS.length) return Promise.resolve([]);
-    const filename = extra.filename;
-    const filesize = extra.videoSize;
-    const hash = extra.videoHash;
-    // API zwraca 422, gdy brakuje rozmiaru lub hashu pliku - Stremio nie zawsze je przekazuje (np. przy pierwszym zapytaniu)
-    if (!filesize || !hash) {
-        console.log('[KickAss] Pomijam - brak videoSize/videoHash w zapytaniu Stremio');
-        return Promise.resolve([]);
-    }
-
-    const perLang = KICKASS_LANGS.map(lang => {
-        const key = `${lang}|${hash || ''}|${filesize || ''}|${filename || ''}`;
-        const cached = kickassSearches.get(key);
-        if (cached && Date.now() - cached.time < KICKASS_TTL) return cached.promise;
-        const promise = kickassSearch(filename, filesize, hash, lang).catch(e => {
-            console.error(`[KickAss] Błąd (${lang}):`, e.message);
-            kickassSearches.delete(key);
-            return [];
-        });
-        kickassSearches.set(key, { time: Date.now(), promise });
-        return promise;
-    });
-    return Promise.all(perLang).then(lists => lists.flat());
-}
-
-/** Wydaje plik zapisany po zakończeniu zadania (zawsze jako SRT w UTF-8) */
-function serveKickass(req, res, url) {
-    const m = url.pathname.match(/^\/subtitles\/kickass\/([A-Za-z0-9_-]+)\.[a-z0-9]{2,4}$/i);
-    const file = m && kickassFiles.get(m[1]);
-    if (!file) {
-        res.writeHead(404);
-        res.end('Not found');
-        return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/srt; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-    res.end(normalizeToSrt(file.buf));
-}
-
 const fansubyFileCache = new Map();
 
 /** Pobiera plik z fansuby (z krótkim cache, żeby ASS+SRT nie liczyły się podwójnie do limitu pobrań) */
@@ -1148,20 +1025,14 @@ builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
             };
         }
         
-        // Źródła: fansuby.cc + kickasssubtitles.com (animesub.info jako fallback)
-        const kickassPromise = kickassFetch(extra);
-        let fansubySubs = [];
+        // Główne źródło: fansuby.cc (animesub.info jako fallback)
         try {
-            fansubySubs = await fansubySubtitles(meta, extra);
+            const fansubySubs = await fansubySubtitles(meta, extra);
+            if (fansubySubs.length) {
+                return { subtitles: fansubySubs };
+            }
         } catch (e) {
             console.error('[Fansuby] Błąd:', e.message);
-        }
-        // Gdy fansuby coś ma, dajemy kickass tylko chwilę (resztę dokończy w tle i trafi do cache);
-        // gdy nie ma nic, czekamy na kickass dłużej.
-        const kickassSubs = await Promise.race([kickassPromise, delay(fansubySubs.length ? 2500 : KICKASS_WAIT_MS, [])]);
-        const combined = [...fansubySubs, ...(kickassSubs || [])];
-        if (combined.length) {
-            return { subtitles: combined };
         }
 
         console.log(`[Meta] title="${meta.title}", season=${meta.season}, episode=${meta.episode}`);
@@ -1496,11 +1367,6 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    if (url.pathname.startsWith('/subtitles/kickass/')) {
-        serveKickass(req, res, url);
-        return;
-    }
-
     if (url.pathname === '/subtitles/fansuby' || url.pathname.startsWith('/subtitles/fansuby/')) {
         serveFansuby(req, res, url);
         return;
