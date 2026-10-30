@@ -782,11 +782,17 @@ async function fansubySubtitles(meta, extra) {
         return [];
     }
 
+    const hasEpisode = meta.episode !== null && meta.episode !== undefined;
+    // Fansuby to serwis anime: /match bez numeru odcinka zwraca 400, więc zwykłych filmów (tt...) nie odpytujemy
+    if (!meta.kitsuId && !hasEpisode && !(meta.season !== null && meta.season !== undefined)) {
+        console.log('[Fansuby] Pomijam - to film bez numeru odcinka');
+        return [];
+    }
     if (meta.kitsuId) {
         const ids = await kitsuMappings(meta.kitsuId);
         if (ids.anilistId) params.anilistId = ids.anilistId;
         else if (ids.malId) params.malId = ids.malId;
-        if (meta.episode !== null && meta.episode !== undefined) params.episode = meta.episode;
+        params.episode = hasEpisode ? meta.episode : 1; // film anime z Kitsu = odcinek 1
     }
 
     const cacheKey = JSON.stringify(params);
@@ -960,10 +966,9 @@ const KICKASS_API = (process.env.KICKASS_URL || 'https://kickasssubtitles.com') 
 const KICKASS_KEY = process.env.KICKASS_KEY || '';
 const KICKASS_WAIT_MS = parseInt(process.env.KICKASS_TIMEOUT_MS, 10) || 6500; // ile czekamy na wynik przy odpowiedzi do Stremio
 const KICKASS_TTL = 30 * 60 * 1000;
-// Języki szukane w kickasssubtitles (kody serwisu -> kody Stremio). Ustaw np. KICKASS_LANGS=pl,en. Domyślnie tylko polski.
-const KICKASS_LANG_CODES = { pl: 'pol', en: 'eng' };
-const KICKASS_LANGS = (process.env.KICKASS_LANGS || 'pl')
-    .split(',').map(l => l.trim().toLowerCase()).filter(l => KICKASS_LANG_CODES[l]);
+// Kickasssubtitles: tylko polski (kody serwisu -> kody Stremio)
+const KICKASS_LANG_CODES = { pl: 'pol' };
+const KICKASS_LANGS = ['pl'];
 const kickassHttp = axios.create({
     baseURL: KICKASS_API,
     headers: { Accept: 'application/json', Authorization: `Bearer ${KICKASS_KEY}` },
@@ -993,19 +998,19 @@ async function kickassSearch(filename, filesize, hash, lang) {
     const r = await kickassHttp.post('/search', form, { validateStatus: st => st < 500 });
     if (r.status === 401 || r.status === 403) { console.error('[KickAss] Błąd autoryzacji - sprawdź KICKASS_KEY'); return []; }
     if (r.status === 429) { console.warn('[KickAss] 429 - limit zapytań'); return []; }
-    if (r.status >= 300 || !r.data || !r.data.id) { console.log(`[KickAss] /search status ${r.status}`); return []; }
+    if (r.status >= 300 || !r.data || !r.data.id) { console.log(`[KickAss] /search status ${r.status}: ${JSON.stringify(r.data).slice(0, 600)}`); return []; }
 
     const taskId = r.data.id;
     let task = r.data;
     const deadline = Date.now() + 25000; // zadanie dalej liczymy w tle, nawet gdy Stremio nie czeka
     while (task.status !== 'completed' && Date.now() < deadline) {
-        if (['failed', 'error', 'cancelled'].includes(task.status)) { console.log(`[KickAss] Zadanie ${task.status}`); return []; }
+        if (['failed', 'error', 'cancelled'].includes(task.status)) { console.log(`[KickAss] Zadanie ${task.status}: ${JSON.stringify(task).slice(0, 800)}`); return []; }
         await delay(1000);
         const t = await kickassHttp.get(`/tasks/${encodeURIComponent(taskId)}`, { validateStatus: st => st < 500 });
         if (t.status >= 300 || !t.data) return [];
         task = t.data;
     }
-    if (task.status !== 'completed') { console.log('[KickAss] Zadanie nie zdążyło się zakończyć'); return []; }
+    if (task.status !== 'completed') { console.log(`[KickAss] Zadanie nie zdążyło się zakończyć: ${JSON.stringify(task).slice(0, 400)}`); return []; }
 
     const subs = (task.result && task.result.subtitles) || [];
     const out = [];
@@ -1024,6 +1029,7 @@ async function kickassSearch(filename, filesize, hash, lang) {
         });
     });
     console.log(`[KickAss] (${lang}) Znaleziono ${out.length} napisów`);
+    if (!out.length) console.log(`[KickAss] Odpowiedź bez napisów: ${JSON.stringify(task).slice(0, 600)}`);
     return out;
 }
 
@@ -1033,7 +1039,11 @@ function kickassFetch(extra) {
     const filename = extra.filename;
     const filesize = extra.videoSize;
     const hash = extra.videoHash;
-    if (!filename && !hash) return Promise.resolve([]); // bez nazwy pliku lub hashu nie ma po czym szukać
+    // API zwraca 422, gdy brakuje rozmiaru lub hashu pliku - Stremio nie zawsze je przekazuje (np. przy pierwszym zapytaniu)
+    if (!filesize || !hash) {
+        console.log('[KickAss] Pomijam - brak videoSize/videoHash w zapytaniu Stremio');
+        return Promise.resolve([]);
+    }
 
     const perLang = KICKASS_LANGS.map(lang => {
         const key = `${lang}|${hash || ''}|${filesize || ''}|${filename || ''}`;
