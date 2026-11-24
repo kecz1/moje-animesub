@@ -357,7 +357,7 @@ const DOWNLOAD_URL = `${BASE_URL}/sciagnij.php`;
 // Manifest wtyczki
 const manifest = {
     id: 'community.animesub.info',
-    version: '1.1.0',
+    version: '1.3.0',
     name: 'Polskie napisy do anime (fansuby + AnimeSub.info)',
     description: 'Polskie napisy do anime z fansuby.cc oraz animesub.info',
     logo: 'https://i.imgur.com/qKLYVZx.png',
@@ -737,6 +737,9 @@ function findLocalSubtitle(title, season, episode) {
 // ============================================================
 const FANSUBY_API = (process.env.FANSUBY_URL || 'https://fansuby.cc') + '/api/v1';
 const FANSUBY_KEY = process.env.FANSUBY_KEY || '';
+// Filmy bez numeru odcinka (np. filmy anime z katalogu IMDb) też są szukane w fansuby jako "odcinek 1".
+// Domyślnie włączone; wyłączysz zmienną FANSUBY_TRY_MOVIES=0 (oszczędza zapytania przy zwykłych filmach).
+const FANSUBY_TRY_MOVIES = process.env.FANSUBY_TRY_MOVIES !== '0';
 const fsb = axios.create({
     headers: { Authorization: `Bearer ${FANSUBY_KEY}` },
     timeout: 10000
@@ -782,11 +785,26 @@ async function fansubySubtitles(meta, extra) {
         return [];
     }
 
+    const hasEpisode = meta.episode !== null && meta.episode !== undefined;
+    // Film bez numeru odcinka (tt...): /match bez odcinka zwraca 400, więc próbujemy jako odcinek 1
+    const isPlainMovie = !meta.kitsuId && !hasEpisode && !(meta.season !== null && meta.season !== undefined);
+    if (isPlainMovie) {
+        if (!FANSUBY_TRY_MOVIES) {
+            console.log('[Fansuby] Pomijam - film bez numeru odcinka (FANSUBY_TRY_MOVIES=0)');
+            return [];
+        }
+        if (!meta.title) return [];
+        // nazwa pliku od Stremio ma rok, rozdzielczość itp. (np. "1993" mogłoby wyjść jako numer odcinka),
+        // więc do /match idzie czysty tytuł z odcinkiem 1
+        params.filename = `${meta.title} - 01.mkv`;
+        params.episode = 1;
+        console.log(`[Fansuby] Film bez odcinka - próbuję jako odcinek 1: "${meta.title}"`);
+    }
     if (meta.kitsuId) {
         const ids = await kitsuMappings(meta.kitsuId);
         if (ids.anilistId) params.anilistId = ids.anilistId;
         else if (ids.malId) params.malId = ids.malId;
-        if (meta.episode !== null && meta.episode !== undefined) params.episode = meta.episode;
+        params.episode = hasEpisode ? meta.episode : 1; // film anime z Kitsu = odcinek 1
     }
 
     const cacheKey = JSON.stringify(params);
@@ -833,6 +851,7 @@ async function fansubySubtitles(meta, extra) {
     }
     fansubyCache.set(cacheKey, { time: Date.now(), data });
     console.log(`[Fansuby] Znaleziono ${data.length} napisów`);
+    if (data[0]) console.log(`[Fansuby] Przykładowy link: ${data[0].url}`);
     return data;
 }
 
@@ -972,6 +991,7 @@ async function serveFansuby(req, res, url) {
     let mode = url.searchParams.get('as') || 'srt';
     const m = url.pathname.match(/^\/subtitles\/fansuby\/(\d+)\.(ass|srt)$/);
     if (m) { id = m[1]; mode = m[2]; }
+    console.log(`[Fansuby Download] ${req.method} ${url.pathname}${url.search}`);
     if (!/^\d+$/.test(id || '')) {
         res.writeHead(400);
         res.end('Bad id');
@@ -995,6 +1015,7 @@ async function serveFansuby(req, res, url) {
         }
         res.writeHead(200, { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' });
         res.end(body);
+        console.log(`[Fansuby Download] OK id=${id} tryb=${mode} (${body.length} znaków)`);
     } catch (e) {
         const status = (e.response && e.response.status) || 500;
         console.error('[Fansuby Download]', status, e.message);
@@ -1351,6 +1372,11 @@ if (process.env.BASE_URL) {
 }
 
 console.log(`[Config] BASE_URL: ${BASE_URL_RESOLVED}`);
+if (process.env.PORT && /^http:\/\/localhost/i.test(BASE_URL_RESOLVED)) {
+    console.warn('[Config] UWAGA: BASE_URL wskazuje na localhost, więc Stremio nie pobierze napisów z listy. Ustaw zmienną BASE_URL na publiczny adres https tej usługi.');
+} else if (/^http:\/\//i.test(BASE_URL_RESOLVED) && !/localhost/i.test(BASE_URL_RESOLVED)) {
+    console.warn('[Config] UWAGA: BASE_URL zaczyna się od http://. Stremio może blokować napisy spod adresu bez https.');
+}
 
 const addonInterface = builder.getInterface();
 const server = http.createServer((req, res) => {
@@ -1397,19 +1423,6 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`
-╔════════════════════════════════════════════════════════════╗
-║         AnimeSub.info Stremio Addon                        ║
-╠════════════════════════════════════════════════════════════╣
-║  Serwer uruchomiony na: http://localhost:${PORT}              ║
-║                                                            ║
-║  Link do instalacji w Stremio:                             ║
-║  http://localhost:${PORT}/manifest.json                       ║
-║                                                            ║
-║  Aby zainstalować:                                         ║
-║  1. Otwórz Stremio                                         ║
-║  2. Idź do Addons -> Community Addons                      ║
-║  3. Wklej powyższy link w pole "Addon Repository URL"      ║
-╚════════════════════════════════════════════════════════════╝
-`);
+    console.log(`[Start] Serwer nasłuchuje na porcie ${PORT}`);
+    console.log(`[Start] Link do instalacji w Stremio: ${BASE_URL_RESOLVED}/manifest.json`);
 });
