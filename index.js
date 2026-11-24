@@ -5,6 +5,7 @@ const iconv = require('iconv-lite');
 const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 // Zmienna globalna dla BASE_URL - ustawiana przy starcie serwera
 let BASE_URL_RESOLVED = '';
@@ -216,7 +217,7 @@ function assTextToSrtText(rawText) {
  */
 function convertAssToSrt(assContent, opts = {}) {
     const MAX_LINES = opts.maxLines || 4;
-    const lines = assContent.replace(/\r/g, '').replace(/^\uFEFF/, '').split('\n');
+    const lines = stripAssHeavySections(assContent.replace(/^\uFEFF/, '')).split('\n');
     let section = '';
     let eventFormat = [];
     let styleFormat = [];
@@ -874,13 +875,30 @@ function wantsLiteAss(req, liteParam) {
 }
 
 /**
+ * Usuwa z ASS sekcje [Fonts], [Graphics] i [Aegisub Extradata]. To osadzone czcionki i obrazy (zakodowane tekstem),
+ * które potrafią mieć kilka MB, a odtwarzacze mobilne i konwersja do SRT i tak z nich nie korzystają.
+ */
+function stripAssHeavySections(assText) {
+    const HEAVY = new Set(['[fonts]', '[graphics]', '[aegisub extradata]']);
+    const KNOWN = new Set(['[script info]', '[v4 styles]', '[v4+ styles]', '[events]', '[aegisub project garbage]']);
+    const out = [];
+    let skipping = false;
+    for (const line of assText.replace(/\r/g, '').split('\n')) {
+        const header = line.trim().toLowerCase();
+        if (HEAVY.has(header)) { skipping = true; continue; }
+        if (skipping && KNOWN.has(header)) skipping = false;
+        if (!skipping) out.push(line);
+    }
+    return out.join('\n');
+}
+
+/**
  * Usuwa z ASS zdarzenia z rysunkami wektorowymi (\p1...). Biblioteka libass (komputer) rysuje je poprawnie,
  * ale prostsze renderery (np. część aplikacji mobilnych) wypisują komendy typu "m 10 20 l 30 40" jako tekst.
  * Pozycje, kolory i style dialogów zostają bez zmian.
  */
 function stripAssDrawings(assText) {
-    return assText
-        .replace(/\r/g, '')
+    return stripAssHeavySections(assText)
         .split('\n')
         .filter(line => !(/^\s*dialogue:/i.test(line) && /\\p[1-9](?![0-9a-z])/i.test(line)))
         .join('\n');
@@ -888,6 +906,13 @@ function stripAssDrawings(assText) {
 
 /** Dekoduje bufor napisów: UTF-8, a przy błędach Windows-1250 / ISO-8859-2 */
 function decodeSubtitleBuffer(buf) {
+    // UTF-16 z BOM (zdarza się w plikach ASS z Aegisub/Windows)
+    if (buf.length > 2 && buf[0] === 0xFF && buf[1] === 0xFE) return buf.slice(2).toString('utf16le');
+    if (buf.length > 2 && buf[0] === 0xFE && buf[1] === 0xFF) {
+        const swapped = Buffer.from(buf.slice(2));
+        swapped.swap16();
+        return swapped.toString('utf16le');
+    }
     const utf8Text = buf.toString('utf-8');
     let text;
     if (!utf8Text.includes('\uFFFD')) {
@@ -919,16 +944,36 @@ function convertVttToSrt(vtt) {
     return out.join('\n\n');
 }
 
-/** Jeśli bufor to ZIP (sygnatura "PK"), zwraca pierwszy plik z napisami; inaczej oddaje bufor bez zmian */
+/**
+ * Rozpakowuje kompresję i archiwa owijające napisy: GZIP (sygnatura 1F 8B) oraz ZIP (sygnatura "PK").
+ * Działa w pętli, bo plik może być spakowany kilka razy (np. ZIP -> GZIP). Inne formaty zwraca bez zmian.
+ */
 function unwrapZip(buf) {
-    if (buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b) {
-        try {
-            const zip = new AdmZip(buf);
-            const entry = zip.getEntries().find(e => !e.isDirectory && /\.(srt|ass|ssa|vtt|sub|txt)$/i.test(e.entryName));
-            if (entry) return entry.getData();
-        } catch (e) {
-            console.error('[Normalize] Błąd rozpakowywania ZIP:', e.message);
+    for (let i = 0; i < 4; i++) {
+        if (buf.length > 18 && buf[0] === 0x1f && buf[1] === 0x8b) {
+            try {
+                buf = zlib.gunzipSync(buf, { maxOutputLength: 100 * 1024 * 1024 });
+                console.log(`[Normalize] Rozpakowano GZIP -> ${buf.length} B`);
+                continue;
+            } catch (e) {
+                console.error('[Normalize] Błąd rozpakowywania GZIP:', e.message);
+                break;
+            }
         }
+        if (buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b) {
+            try {
+                const zip = new AdmZip(buf);
+                const entry = zip.getEntries().find(e => !e.isDirectory && /\.(srt|ass|ssa|vtt|sub|txt)$/i.test(e.entryName));
+                if (entry) {
+                    buf = entry.getData();
+                    console.log(`[Normalize] Rozpakowano ZIP (${entry.entryName}) -> ${buf.length} B`);
+                    continue;
+                }
+            } catch (e) {
+                console.error('[Normalize] Błąd rozpakowywania ZIP:', e.message);
+            }
+        }
+        break;
     }
     return buf;
 }
@@ -939,6 +984,7 @@ function unwrapZip(buf) {
  */
 function normalizeToSrt(buf) {
     buf = unwrapZip(buf);
+    console.log(`[Normalize] Plik ${buf.length} B, początek (hex): ${buf.slice(0, 8).toString('hex')}`);
 
     const text = decodeSubtitleBuffer(buf);
 
@@ -959,6 +1005,11 @@ function normalizeToSrt(buf) {
     // SRT (już gotowy)
     if (text.includes('-->')) {
         return text;
+    }
+    // Nierozpoznany, ogromny plik (archiwum, grafika, bitmapowe napisy) - nie próbujemy go parsować jako tekstu
+    if (buf.length > 1000000) {
+        console.warn(`[Normalize] Nierozpoznany format, ${buf.length} B, początek (hex): ${buf.slice(0, 16).toString('hex')}`);
+        return null;
     }
     // MicroDVD / MPL2 / TMPlayer
     try {
@@ -1012,6 +1063,12 @@ async function serveFansuby(req, res, url) {
             }
         } else {
             body = normalizeToSrt(buf);
+        }
+        if (body === null || body === undefined) {
+            res.writeHead(415, { 'Access-Control-Allow-Origin': '*' });
+            res.end('Unsupported subtitle format');
+            console.warn(`[Fansuby Download] id=${id}: nierozpoznany format pliku (415)`);
+            return;
         }
         res.writeHead(200, { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' });
         res.end(body);
