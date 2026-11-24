@@ -357,7 +357,7 @@ const DOWNLOAD_URL = `${BASE_URL}/sciagnij.php`;
 // Manifest wtyczki
 const manifest = {
     id: 'community.animesub.info',
-    version: '1.3.0',
+    version: '1.3.1',
     name: 'Polskie napisy do anime (fansuby + AnimeSub.info)',
     description: 'Polskie napisy do anime z fansuby.cc oraz animesub.info',
     logo: 'https://i.imgur.com/qKLYVZx.png',
