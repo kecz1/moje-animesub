@@ -386,6 +386,7 @@ const session = axios.create({
 
 const searchCache = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
+const MAX_ANIMESUB_STRATEGIES = parseInt(process.env.MAX_ANIMESUB_STRATEGIES || '24', 10);
 
 async function getMetaInfo(type, id) {
     const parts = id.split(':');
@@ -394,6 +395,7 @@ async function getMetaInfo(type, id) {
     let episode = null;
     let title = null;
     let year = null;
+    let altTitles = [];
     
     if (prefix === 'kitsu') {
         const kitsuId = parts[1];
@@ -412,10 +414,12 @@ async function getMetaInfo(type, id) {
             title = anime.titles?.en_jp || anime.canonicalTitle || anime.titles?.ja_jp || anime.titles?.en;
             year = anime.startDate ? parseInt(anime.startDate.substring(0, 4), 10) : null;
             console.log(`[Kitsu] Pobrano: "${title}" (${year})`);
+            altTitles = [anime.titles?.en, anime.canonicalTitle, anime.titles?.en_us, ...(anime.abbreviatedTitles || [])]
+                .filter(t => isLatinTitle(t) && t !== title);
         } catch (error) {
             console.error('[Kitsu] Błąd pobierania metadanych:', error.message);
         }
-        return { title, year, season, episode, kitsuId };
+        return { title, year, season, episode, kitsuId, altTitles };
     } else {
         const imdbId = parts[0];
         if (type === 'series' && parts.length >= 3) {
@@ -522,9 +526,10 @@ function parseEpisodeInfo(titleOrg, titleEng, titleAlt, description) {
     // 1. Sprawdzanie sezonu
     for (const text of texts) {
         if (season === null) {
-            const seasonMatch = text.match(/(?:Season|Sezon|S|Part)\s*\.?\s*(\d+)|(\d+)(?:nd|rd|th)\s+(?:Season|Sezon)/i);
+            // granice słów (\b): wcześniej 'S' pasowało do końcówki dowolnego słowa (np. 'Episodes 16' -> sezon 16)
+            const seasonMatch = text.match(/\b(?:Season|Sezon|Part)\s*\.?\s*(\d{1,2})\b|\bS(\d{1,2})(?:E\d+)?\b|\b(\d{1,2})(?:nd|rd|th)\s+(?:Season|Sezon)\b/i);
             if (seasonMatch) {
-                season = parseInt(seasonMatch[1] || seasonMatch[2], 10);
+                season = parseInt(seasonMatch[1] || seasonMatch[2] || seasonMatch[3], 10);
             }
         }
     }
@@ -583,45 +588,85 @@ function parseEpisodeInfo(titleOrg, titleEng, titleAlt, description) {
     return { season, episode, epStart, epEnd };
 }
 
-function generateSearchStrategies(title, season, episode) {
-    const strategies = [];
-    let fullWithSpace = title.replace(/:/g, ' ').replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
-    let leftSide = title.split(':')[0].replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
-    let rightSide = "";
+/** Warianty nazwy do wyszukiwania: pełny tytuł, część przed ":" i po ":", bez "The", pierwsze słowa */
+function titleNameVariants(title) {
+    const clean = t => t.replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
+    const out = [];
+    const push = v => { if (v && v.length > 2 && !out.includes(v)) out.push(v); };
+    push(clean(title.replace(/:/g, ' ')));
+    push(clean(title.split(':')[0]));
     if (title.includes(':')) {
-        rightSide = title.split(':').slice(1).join(' ').replace(/[^a-zA-Z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
+        const right = clean(title.split(':').slice(1).join(' '));
+        if (right.length > 3) push(right);
     }
-    const nameVariants = [fullWithSpace, leftSide];
-    if (rightSide && rightSide.length > 3) nameVariants.push(rightSide);
-    
-    let epPad = episode !== null ? episode.toString().padStart(2, '0') : '';
-    for (const name of nameVariants) {
-        if (episode !== null) {
-            if (season && season > 1) {
-                strategies.push({ type: 'en', query: `${name} ${season} ep${epPad}` });
-                strategies.push({ type: 'en', query: `${name} Season ${season} ep${epPad}` });
-            }
-            strategies.push({ type: 'en', query: `${name} ep${epPad}` });
-            if (season && season > 1) {
-                strategies.push({ type: 'org', query: `${name} ${season} ep${epPad}` });
-            }
-            strategies.push({ type: 'org', query: `${name} ep${epPad}` });
+    const full = out[0] || '';
+    if (/^the\s+/i.test(full)) push(full.replace(/^the\s+/i, ''));
+    return out;
+}
+
+/**
+ * Strategie wyszukiwania na animesub.info. Serwis jest stary i nie ma standardu nazw:
+ * numer odcinka bywa w tytule wpisu ("Tytuł ep16"), a bywa że wpis jest tylko pod samym tytułem
+ * (albo pod innym tytułem: romaji / synonim), więc próbujemy wielu wariantów.
+ * Kolejność: najpierw same tytuły (najtańsze i najpewniejsze), potem warianty z odcinkiem.
+ */
+function generateSearchStrategies(title, season, episode, altTitles = []) {
+    const strategies = [];
+    const seen = new Set();
+    const add = (type, query) => {
+        const key = `${type}:${query.toLowerCase()}`;
+        if (!query || seen.has(key)) return;
+        seen.add(key);
+        strategies.push({ type, query });
+    };
+    // tytuł z Cinemeta + tytuły alternatywne (romaji, synonimy z fansuby / Kitsu)
+    const names = [];
+    for (const t of [title, ...altTitles]) {
+        if (!t) continue;
+        for (const v of titleNameVariants(t)) {
+            if (!names.some(n => n.toLowerCase() === v.toLowerCase())) names.push(v);
         }
     }
-    for (const name of nameVariants) {
-        if (season && season > 1) {
-            strategies.push({ type: 'en', query: `${name} ${season}` });
-            strategies.push({ type: 'en', query: `${name} Season ${season}` });
+    const hasEp = episode !== null && episode !== undefined;
+    const epPad = hasEp ? String(episode).padStart(2, '0') : '';
+    const epRaw = hasEp ? String(episode) : '';
+
+    // 1. sezon > 1: tytuł + numer sezonu
+    if (season && season > 1) {
+        for (const name of names) {
+            add('en', `${name} ${season}`);
+            add('en', `${name} Season ${season}`);
+            add('org', `${name} ${season}`);
         }
     }
-    strategies.push({ type: 'en', query: leftSide });
-    return strategies;
+    // 2. same tytuły (en i org)
+    for (const name of names) {
+        add('en', name);
+        add('org', name);
+    }
+    // 3. tytuł + odcinek (część wpisów ma numer w tytule)
+    if (hasEp) {
+        for (const name of names) {
+            if (season && season > 1) {
+                add('en', `${name} ${season} ep${epPad}`);
+                add('org', `${name} ${season} ep${epPad}`);
+            }
+            add('en', `${name} ep${epPad}`);
+            add('org', `${name} ep${epPad}`);
+            if (epRaw !== epPad) add('en', `${name} ep${epRaw}`);
+            add('en', `${name} ${epPad}`);
+            add('org', `${name} ${epPad}`);
+        }
+    }
+    return strategies.slice(0, MAX_ANIMESUB_STRATEGIES);
 }
 
 function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
-    const targetParts = targetTitle.split(':').map(p => p.toLowerCase().replace(/[^a-z0-9]/g, ''));
-    const cleanTargetFull = targetTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const targetsToCompare = [cleanTargetFull, ...targetParts].filter(p => p.length > 2);
+    // targetTitle: string albo tablica (tytuł główny + alternatywne: romaji, synonimy)
+    const titleList = (Array.isArray(targetTitle) ? targetTitle : [targetTitle]).filter(Boolean);
+    const normalize = t => t.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const targetsToCompare = [...new Set(titleList.flatMap(t => [normalize(t), ...t.split(':').map(normalize)]))]
+        .filter(p => p.length > 2);
     
     return subtitles.filter(sub => {
         // 1. PORÓWNYWANIE TYTUŁÓW
@@ -631,29 +676,38 @@ function matchSubtitles(subtitles, targetSeason, targetEpisode, targetTitle) {
             const cleanT = t.toLowerCase().replace(/[^a-z0-9]/g, '');
             for (const target of targetsToCompare) {
                 const similarity = calculateSimilarity(target, cleanT);
-                if (similarity >= 0.6 || cleanT.includes(target) || target.includes(cleanT)) {
+                if (cleanT.length > 2 && (similarity >= 0.6 || cleanT.includes(target) || target.includes(cleanT))) {
                     isTitleMatch = true;
                     break;
                 }
             }
             if (isTitleMatch) break;
         }
-        if (!isTitleMatch) return false;
+        const dbg = `${sub.titleOrg} | ${sub.titleEng} | s=${sub.season} ep=${sub.episode} range=${sub.epStart}-${sub.epEnd}`;
+        if (!isTitleMatch) { console.log(`[Filtr] odrzucony (tytuł): ${dbg}`); return false; }
         
-        // 2. RYGORYSTYCZNY FILTR SEZONÓW
-        if (targetSeason !== null) {
-            if (sub.season !== null && sub.season !== targetSeason) return false;
-            if (targetSeason > 1 && sub.season === null) return false;
+        // 2. FILTR SEZONÓW - tylko dla sezonu > 1 (Cinemeta dla S1 często ma numerację ciągłą,
+        //    a opisy na animesub bywają różne: "Part 2" itp.)
+        if (targetSeason !== null && targetSeason > 1) {
+            if (sub.season === null || sub.season !== targetSeason) {
+                console.log(`[Filtr] odrzucony (sezon, szukam ${targetSeason}): ${dbg}`);
+                return false;
+            }
         }
         
         // 3. FILTR ODCINKÓW
         if (targetEpisode !== null) {
             if (sub.epStart !== null && sub.epEnd !== null) {
-                if (targetEpisode < sub.epStart || targetEpisode > sub.epEnd) return false;
+                if (targetEpisode < sub.epStart || targetEpisode > sub.epEnd) {
+                    console.log(`[Filtr] odrzucony (poza paczką, szukam ${targetEpisode}): ${dbg}`);
+                    return false;
+                }
             } else if (sub.episode !== null && sub.episode !== targetEpisode) {
+                console.log(`[Filtr] odrzucony (odcinek, szukam ${targetEpisode}): ${dbg}`);
                 return false;
             }
         }
+        console.log(`[Filtr] OK: ${dbg}`);
         return true;
     });
 }
@@ -769,6 +823,52 @@ async function kitsuMappings(kitsuId) {
     return out;
 }
 
+const altTitlesCache = new Map();
+const isLatinTitle = t => typeof t === 'string' && t.trim().length > 2 && /^[\x20-\x7E\u00C0-\u024F]+$/.test(t);
+function mergeAltTitles(meta, titles) {
+    const norm = t => t.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const have = new Set([meta.title, ...(meta.altTitles || [])].filter(Boolean).map(norm));
+    meta.altTitles = meta.altTitles || [];
+    for (const t of titles) {
+        if (!isLatinTitle(t)) continue; // animesub (ISO-8859-2) - japońskie znaki nie pomogą
+        const n = norm(t);
+        if (n.length > 2 && !have.has(n)) { have.add(n); meta.altTitles.push(t.trim()); }
+    }
+}
+
+/**
+ * Tytuły alternatywne (romaji, synonimy) - animesub bywa pod innym tytułem niż Cinemeta
+ * (np. "Daemons of the Shadow Realm" vs "Yomi no Tsugai"). Źródło: fansuby /series (jeśli jest klucz).
+ * Kitsu dostarcza je już w getMetaInfo.
+ */
+async function ensureAltTitles(meta) {
+    if (!meta.title || !FANSUBY_KEY) return;
+    const norm = t => (t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const key = norm(meta.title);
+    if (altTitlesCache.has(key)) { mergeAltTitles(meta, altTitlesCache.get(key)); return; }
+    const found = [];
+    try {
+        const r = await fsb.get(`${FANSUBY_API}/series`, { params: { q: meta.title.slice(0, 200), limit: 5 }, validateStatus: s => s < 500 });
+        if (r.status === 200) {
+            // bierzemy tylko serię, której tytuł angielski/romaji pokrywa się z tytułem z Cinemeta
+            const hit = (r.data.data || []).find(x => norm(x.title && x.title.english) === key || norm(x.title && x.title.romaji) === key);
+            if (hit) {
+                found.push(hit.title.romaji, hit.title.english);
+                const d = await fsb.get(`${FANSUBY_API}/series/${hit.id}`, { validateStatus: s => s < 500 });
+                if (d.status === 200 && d.data.data) found.push(...(d.data.data.synonyms || []).slice(0, 6));
+            } else {
+                console.log('[Fansuby] /series: brak dokładnego trafienia dla tytułu, pomijam tytuły alternatywne');
+            }
+        } else {
+            console.log(`[Fansuby] /series status ${r.status}`, JSON.stringify(r.data && r.data.error));
+        }
+    } catch (e) {
+        console.error('[Fansuby] /series błąd:', e.message);
+    }
+    altTitlesCache.set(key, found);
+    mergeAltTitles(meta, found);
+}
+
 /** Szuka napisów w fansuby przez /match i zwraca listę w formacie Stremio */
 async function fansubySubtitles(meta, extra) {
     if (!FANSUBY_KEY) return [];
@@ -776,17 +876,24 @@ async function fansubySubtitles(meta, extra) {
     const params = { format: 'srt', lang: 'pl' };
     const ep = String(meta.episode ?? 1).padStart(2, '0');
 
-    if (extra && extra.filename) {
-        params.filename = extra.filename;
-    } else if (meta.title) {
-        params.filename = (meta.kitsuId || !meta.season)
+    const hasEpisode = meta.episode !== null && meta.episode !== undefined;
+    const syntheticName = meta.title
+        ? ((meta.kitsuId || !meta.season)
             ? `${meta.title} - ${ep}.mkv`
-            : `${meta.title}.S${String(meta.season).padStart(2, '0')}E${ep}.mkv`;
+            : `${meta.title}.S${String(meta.season).padStart(2, '0')}E${ep}.mkv`)
+        : null;
+
+    if (extra && extra.filename) {
+        // usuń sufiks wersji (E16v2 -> E16, "- 16v2" -> "- 16"), który psuje parser /match (400)
+        params.filename = extra.filename.replace(/(\d)v\d+(?=[\s.\])_-]|$)/gi, '$1');
+    } else if (syntheticName) {
+        params.filename = syntheticName;
     } else {
         return [];
     }
+    // numer odcinka z Stremio nadpisuje to, co serwer odczyta z nazwy pliku
+    if (hasEpisode) params.episode = meta.episode;
 
-    const hasEpisode = meta.episode !== null && meta.episode !== undefined;
     // Film bez numeru odcinka (tt...): /match bez odcinka zwraca 400, więc próbujemy jako odcinek 1
     const isPlainMovie = !meta.kitsuId && !hasEpisode && !(meta.season !== null && meta.season !== undefined);
     if (isPlainMovie) {
@@ -813,14 +920,25 @@ async function fansubySubtitles(meta, extra) {
     if (cached && Date.now() - cached.time < FANSUBY_CACHE_TTL) return cached.data;
 
     console.log(`[Fansuby] /match`, params);
-    const r = await fsb.get(`${FANSUBY_API}/match`, { params, validateStatus: s => s < 500 });
+    let r = await fsb.get(`${FANSUBY_API}/match`, { params, validateStatus: s => s < 500 });
+    if (r.status === 400 && syntheticName && params.filename !== syntheticName && !isPlainMovie) {
+        console.log('[Fansuby] 400:', JSON.stringify(r.data && r.data.error), '- ponawiam z nazwą zbudowaną z tytułu');
+        const retryParams = { ...params, filename: syntheticName };
+        console.log(`[Fansuby] /match (retry)`, retryParams);
+        r = await fsb.get(`${FANSUBY_API}/match`, { params: retryParams, validateStatus: s => s < 500 });
+    }
     if (r.status === 429) {
         console.warn(`[Fansuby] 429 rate limit, Retry-After=${r.headers['retry-after']}`);
         return [];
     }
     if (r.status !== 200) {
-        console.log(`[Fansuby] status ${r.status}`);
+        console.log(`[Fansuby] status ${r.status}`, JSON.stringify(r.data && r.data.error));
         return [];
+    }
+
+    if (r.data && r.data.match && r.data.match.series && r.data.match.series.title) {
+        const st = r.data.match.series.title;
+        mergeAltTitles(meta, [st.romaji, st.english]);
     }
 
     const preferAss = PREFER_ASS;
@@ -1119,14 +1237,18 @@ builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
             return { subtitles: [] };
         }
         
-        const strategies = generateSearchStrategies(meta.title, meta.season, meta.episode);
+        await ensureAltTitles(meta);
+        const altTitles = meta.altTitles || [];
+        if (altTitles.length) console.log(`[Tytuły alternatywne] ${altTitles.join(' | ')}`);
+        const strategies = generateSearchStrategies(meta.title, meta.season, meta.episode, altTitles);
+        console.log(`[Strategie] ${strategies.length} wariantów do sprawdzenia`);
         let allSubtitles = [];
         const seenIds = new Set();
         
         for (const strategy of strategies) {
             console.log(`[Strategia] "${strategy.query}" (${strategy.type})`);
             const results = await searchSubtitles(strategy.query, strategy.type);
-            const matched = matchSubtitles(results, meta.season, meta.episode, meta.title);
+            const matched = matchSubtitles(results, meta.season, meta.episode, [meta.title, ...altTitles]);
             for (const sub of matched) {
                 if (!seenIds.has(sub.id)) {
                     seenIds.add(sub.id);
